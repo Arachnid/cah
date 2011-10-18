@@ -6,3 +6,18 @@ api_version: 1
 handlers:
 - url: /static
   static_dir: static
+
+skip_files: |
+ ^(.*/)?(
+ (app\.yaml)|
+ (app\.yml)|
+ (index\.yaml)|
+ (index\.yml)|
+ (#.*#)|
+ (.*~)|
+ (.*\.py[co])|
+ (.*/RCS/.*)|
+ (\..*)|
+ (webapp2\.py)|
+ (jinja2/.*)|
+ )$
