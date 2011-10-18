@@ -118,7 +118,7 @@ function getToken(){
   plus_id = gapi.hangout.Participant.id
   
   $.ajax({
-    url: "/api/join_game",
+    url: "http://cah-xhack.appspot.com/api/join_game",
     success: function(data){
       openChannel(data.channel_token);
     }
