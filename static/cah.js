@@ -95,8 +95,8 @@ function onParticipantsChanged(participants) {
 // channel api management
 function onOpened() {
   connected = true;
-  window.alert('connected to server'); 
-};
+  window.alert('connected to server');
+}
 
 // placeholder - handling a message from the channel
 function onMessage(m) {
