@@ -2,6 +2,8 @@ import uuid
 import webapp2
 from webapp2_extras import jinja2
 
+from google.appengine.api import channel
+
 import models
 
 try:
@@ -36,6 +38,17 @@ class NewGameHandler(BaseHandler):
     self.render_jsonp(response)
 
 
+class SendMessageHandler(BaseHandler):
+  def get(self):
+    hangout_id = self.request.GET['hangout_id']
+    message = self.request.GET['message']
+    game = models.Game.get_or_insert(hangout_id)
+    participants = models.Participant.query(ancestor=game.key).fetch()
+    for participant in participants:
+      channel.send_message(participant.channel_id, message)
+
+
 application = webapp2.WSGIApplication([
     ('/api/join_game', NewGameHandler),
+    ('/api/send_message', SendMessageHandler),
 ], debug=True)
