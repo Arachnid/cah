@@ -50,7 +50,7 @@ var participants_ = null;
  * @type {boolean}
  * @private
  */
-var connected = null;
+var connected = false;
 
 /**
  * Create required DOM elements and listeners.
@@ -100,52 +100,58 @@ function onOpened() {
 
 // placeholder - handling a message from the channel
 function onMessage(m) {
-//alert('received message');
-//alert(m.data);
-  newMessage = JSON.parse(m.data);
-//alert('got here!');
+  var newMessage, result_string;
+  window.alert('received message:' + m.data);
 
-  // todo - fix with real channel message structure
-  var result_string = newMessage.content;
+  // TODO(brettmorgan): include json2 for older browsers
+  newMessage = JSON.parse(m.data);
+
+  // TODO(brettmorgan): fix with real channel message structure
+  result_string = newMessage.content;
 
   document.getElementById('channel_message').innerHTML = result_string;
-};
-
-function getToken(){
-  var hangout_id, plus_id;
-  
-  hangout_id = gapi.hangout.getHangoutId();
-  plus_id = gapi.hangout.Participant.id;
-  
-  $.ajax({
-    url: "http://cah-xhack.appspot.com/api/join_game",
-    success: function(data){
-      openChannel(data.channel_token);
-    }
-    data: {
-      hangout_id: hangout_id,
-      plus_id: plus_id
-    }
-  });
-  
-};
+}
 
 /**
  * Opens a Channel.
  * @param {string} token
  */
-function openChannel(token){
- var channel = new goog.appengine.Channel(token);
- var handler = {
-      'onopen': onOpened,
-      'onmessage': onMessage,
-      'onerror': function() {},
-      'onclose': function() {}
-   };
- var socket = channel.open(handler);
- socket.onopen = onOpened;
- socket.onmessage = onMessage;     
-};
+function openChannel(token) {
+  var channel, handler, socket;
+
+  channel = new goog.appengine.Channel(token);
+  handler = {
+    'onopen': onOpened,
+    'onmessage': onMessage,
+    'onerror': function () {},
+    'onclose': function () {}
+  };
+  socket = channel.open(handler);
+  socket.onopen = onOpened;
+  socket.onmessage = onMessage;
+}
+
+/**
+ * Get a game token, by joining a game.
+ */
+function getToken() {
+  var hangout_id, plus_id, ajax_data;
+
+  hangout_id = gapi.hangout.getHangoutId();
+  plus_id = gapi.hangout.Participant.id;
+  ajax_data = {
+    hangout_id: hangout_id,
+    plus_id: plus_id
+  };
+
+  $.ajax({
+    url: "http://cah-xhack.appspot.com/api/join_game",
+    success: function (data) {
+      openChannel(data.channel_token);
+    },
+    data: ajax_data
+  });
+}
 
 
 (function () {
