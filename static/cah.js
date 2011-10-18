@@ -124,3 +124,63 @@ function onParticipantsChanged(participants) {
     gapi.hangout.addApiReadyListener(initHangout);
   }
 }());
+
+// channel api management
+
+
+function onOpened() {
+  connected = true;
+  alert('connected to server'); 
+};
+
+// placeholder - handling a message from the channel
+function onMessage(m) {
+//alert('received message');
+//alert(m.data);
+  newMessage = JSON.parse(m.data);
+//alert('got here!');
+
+  // todo - fix with real channel message structure
+  var result_string = newMessage.content;
+
+  document.getElementById('channel_message').innerHTML = result_string;
+};
+
+function getToken(){
+  hangout_id = gapi.hangout.getHangoutId();
+  plus_id = gapi.hangout.Participant.id
+  // todo -- use jquery ajax call instead
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/new_game?hangout_id=' + hangout_id + '&plus_id=' + plus_id, false);
+  xhr.send(null);
+    
+  if (xhr.status == 200) {
+   return(xhr.responseText);
+  }     
+};
+
+function openChannel(token){
+ var channel = new goog.appengine.Channel(token);
+ var handler = {
+      'onopen': onOpened,
+      'onmessage': onMessage,
+      'onerror': function() {},
+      'onclose': function() {}
+   };
+ var socket = channel.open(handler);
+ socket.onopen = onOpened;
+ socket.onmessage = onMessage;     
+};
+
+
+function initializeToken() {
+ var token = getToken();
+ if ( token != null  && token != 'error') {
+    //strip newline from returned token
+     var cleantoken =  token.replace("\n", "", "g");
+     openChannel(cleantoken);  
+   } else {
+     alert('Error fetching token');
+   }
+};
+   
