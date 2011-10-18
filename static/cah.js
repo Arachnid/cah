@@ -133,10 +133,11 @@ function openChannel(token) {
  * Get a game token, by joining a game.
  */
 function getToken() {
-  var hangout_id, plus_id, ajax_data;
+  var hangout_id, user_hangout_id, plus_id, ajax_data;
 
   hangout_id = gapi.hangout.getHangoutId();
-  plus_id = gapi.hangout.Participant.id;
+  user_hangout_id = gapi.hangout.getParticipantId();
+  plus_id = gapi.hangout.getParticipantById(user_hangout_id).id;
   ajax_data = {
     hangout_id: hangout_id,
     plus_id: plus_id
