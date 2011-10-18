@@ -22,8 +22,6 @@
  * @author Nick Johnson (Google)
  */
 
-/*jslint browser: true, unparam: true, sloppy: true, nomen: true, maxlen: 100, indent: 2 */
-
 /**
  * Shared state of the app.
  * @type {Object.<!string, !string>}
@@ -195,5 +193,4 @@ function getToken() {
   }
 }());
 
-
-
+/*jslint browser: true, unparam: true, sloppy: true, nomen: true, maxlen: 100, indent: 2 */
