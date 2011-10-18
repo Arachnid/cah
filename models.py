@@ -26,9 +26,11 @@ class Participant(model.Model):
         participant.channel_id = str(participant.key) 
         participant.channel_token = channel.create_channel(
             participant.channel_id)
-        participant.put()
+      participant.playing = True
+      participant.put()
       return participant
     return model.transaction(_tx)
 
   channel_id = model.StringProperty(indexed=False)
   channel_token = model.StringProperty(indexed=False)
+  playing = model.BooleanProperty(required=True, default=True)

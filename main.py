@@ -1,6 +1,7 @@
 import uuid
 import webapp2
 from webapp2_extras import jinja2
+from ndb import model
 
 from google.appengine.api import channel
 
@@ -26,7 +27,7 @@ class BaseHandler(webapp2.RequestHandler):
                                      simplejson.dumps(response)))
 
 
-class NewGameHandler(BaseHandler):
+class JoinGameHandler(BaseHandler):
   def get(self):
     hangout_id = self.request.GET['hangout_id']
     game = models.Game.get_or_insert(hangout_id)
@@ -37,18 +38,37 @@ class NewGameHandler(BaseHandler):
     }
     self.render_jsonp(response)
 
+class LeaveGameHandler(BaseHandler):
+  def get(self):
+    hangout_id = self.request.GET['hangout_id']
+    plus_id = self.request.GET['plus_id']
+    channel_token = self.request.GET['channel_token']
+    participant_key = model.Key(models.Game, hangout_id,
+                                models.Participant, plus_id)
+    participant = participant_key.get()
+    if participant.channel_token == channel_token:
+      # Remove user from game
+      participant.playing = False
+      participant.put()
+      self.render_jsonp({'status': 'OK'})
+    else:
+      self.render_jsonp({'status': 'Error'})
+
 
 class SendMessageHandler(BaseHandler):
   def get(self):
     hangout_id = self.request.GET['hangout_id']
     message = self.request.GET['message']
     game = models.Game.get_or_insert(hangout_id)
-    participants = models.Participant.query(ancestor=game.key).fetch()
+    participants = models.Participant.query(
+        ancestor=game.key,
+        models.Participant.playing == True).fetch()
     for participant in participants:
       channel.send_message(participant.channel_id, message)
+    self.render_jsonp({'status': 'OK'})
 
 
 application = webapp2.WSGIApplication([
-    ('/api/join_game', NewGameHandler),
+    ('/api/join_game', JoinGameHandler),
     ('/api/send_message', SendMessageHandler),
 ], debug=True)
