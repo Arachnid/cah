@@ -115,7 +115,7 @@ function getToken(){
   var hangout_id, plus_id;
   
   hangout_id = gapi.hangout.getHangoutId();
-  plus_id = gapi.hangout.Participant.id
+  plus_id = gapi.hangout.Participant.id;
   
   $.ajax({
     url: "http://cah-xhack.appspot.com/api/join_game",
