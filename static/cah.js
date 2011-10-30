@@ -135,9 +135,12 @@ function openChannel(token) {
 function getToken() {
   var hangout_id, user_hangout_id, plus_id, ajax_data;
 
-  hangout_id = gapi.hangout.getHangoutId();
+  // hangout_id = gapi.hangout.getHangoutId();
+  // temp testing
+  hangout_id = "12345";
   user_hangout_id = gapi.hangout.getParticipantId();
   plus_id = gapi.hangout.getParticipantById(user_hangout_id).id;
+  alert("hangout id, user id, and plus id in getToken: " + hangout_id + ", " + user_hangout_id + ", " + plus_id);
   ajax_data = {
     hangout_id: hangout_id,
     plus_id: plus_id
@@ -185,12 +188,16 @@ function getToken() {
           onParticipantsChanged(initParticipants);
         }
       }
+      // var hid = gapi.hangout.getHangoutId();
+      // var pid = gapi.hangout.getParticipantId();
+      // alert("hangout and p id try 1: " + hid + " " + pid);
+
+      getToken();
 
       gapi.hangout.removeApiReadyListener(initHangout);
     };
 
     gapi.hangout.addApiReadyListener(initHangout);
-    getToken();
   }
 }());
 

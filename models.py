@@ -33,4 +33,4 @@ class Participant(model.Model):
 
   channel_id = model.StringProperty(indexed=False)
   channel_token = model.StringProperty(indexed=False)
-  playing = model.BooleanProperty(required=True, default=True)
+  playing = model.BooleanProperty(default=True)

@@ -2,6 +2,7 @@ import uuid
 import webapp2
 from webapp2_extras import jinja2
 from ndb import model
+import logging
 
 from google.appengine.api import channel
 
@@ -61,8 +62,8 @@ class SendMessageHandler(BaseHandler):
     message = self.request.GET['message']
     game = models.Game.get_or_insert(hangout_id)
     participants = models.Participant.query(
-        ancestor=game.key,
-        models.Participant.playing == True).fetch()
+        models.Participant.playing == True,
+        ancestor=game.key).fetch()
     for participant in participants:
       channel.send_message(participant.channel_id, message)
     self.render_jsonp({'status': 'OK'})
