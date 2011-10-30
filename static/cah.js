@@ -151,7 +151,8 @@ function getToken() {
     success: function (data) {
       openChannel(data.channel_token);
     },
-    data: ajax_data
+    data: ajax_data,
+    dataType: "jsonp"
   });
 }
 
