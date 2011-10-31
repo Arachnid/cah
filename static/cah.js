@@ -139,7 +139,7 @@ function getToken() {
   // temp testing
   user_hangout_id = gapi.hangout.getParticipantId();
   plus_id = gapi.hangout.getParticipantById(user_hangout_id).id;
-  alert("hanout_id = " + hanout_id + ", user_hangout_id = " + user_hangout_id + ", plus_id = " + plus_id);
+  alert("hangout_id = " + hangout_id + ", user_hangout_id = " + user_hangout_id + ", plus_id = " + plus_id);
   ajax_data = {
     hangout_id: "12345",
     plus_id: plus_id
