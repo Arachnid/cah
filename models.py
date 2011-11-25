@@ -6,6 +6,7 @@ from ndb import model
 import cards
 
 GAME_STATES = ['new', 'start_round', 'voting', 'scores']
+ROUNDS_PER_GAME = 5
 
 class Hangout(model.Model):
   current_game = db.KeyProperty()
@@ -45,12 +46,14 @@ class Game(model.Model):
   timeout_at = model.DateTimeProperty()
   start_time = model.DateTimeProperty(required=True, auto_now_add=True)
   end_time = model.DateTimeProperty()
+  current_round = model.IntegerProperty()
 
   @classmethod
   def new_game(cls, hangout):
     return cls(
         parent=hangout,
         state='new',
+        current_round = 0,
         question_deck=random.shuffle(range(len(cards.questions))),
         answer_deck=random.shuffle(range(len(cards.answers))),
     )
