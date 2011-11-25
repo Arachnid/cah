@@ -10,6 +10,7 @@ class Game(model.Model):
   answer_deck = model.IntegerProperty(repeated=True)
   current_question = model.IntegerProperty()
   is_paused = model.BooleanProperty(required=True, default=False)
+  timeout_at = model.DateTimeProperty()
   start_time = model.DateTimeProperty(required=True, auto_now_add=True)
   end_time = model.DateTimeProperty()
 
