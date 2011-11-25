@@ -31,13 +31,14 @@ class BaseHandler(webapp2.RequestHandler):
 class JoinGameHandler(BaseHandler):
   def get(self):
     hangout_id = self.request.GET['hangout_id']
-    game = models.Game.get_or_insert(hangout_id)
+    game = models.Hangout.get_current_game(hangout_id)
     plus_id = self.request.GET['plus_id']
     participant = models.Participant.get_participant(game, plus_id)
     response = {
       'channel_token': participant.channel_token,
     }
     self.render_jsonp(response)
+
 
 class LeaveGameHandler(BaseHandler):
   def get(self):

@@ -1,11 +1,43 @@
+import random
+
 from google.appengine.api import channel
 from ndb import model
 
+import cards
+
 GAME_STATES = ['new', 'start_round', 'voting', 'scores']
 
-class Game(model.Model):
+class Hangout(model.Model):
+  current_game = db.KeyProperty()
+  
+  @property
+  def hangout_id(self):
+    return self.key.name()
 
-  state = model.StringProperty(choices=STATES)
+  @classmethod
+  def get_current_game(cls, hangout_id):
+    """Retrieves the current game, or creates one if none exists."""
+    def _tx():
+      dirty = False
+      hangout = cls.get_by_id(hangout_id)
+      if not hangout:
+        hangout = cls(id=hangout_id)
+        dirty = True
+      if hangout.current_game:
+        game = hangout.current_game.get()
+      else:
+        game = Game.new_game(hangout)
+        dirty = True
+      if dirty:
+        model.put_multi([hangout, game])
+      return game
+    return model.transaction(_tx)
+
+
+class Game(model.Model):
+  # Child entity of the hangout this game is in
+
+  state = model.StringProperty(choices=STATES, default='new')
   question_deck = model.IntegerProperty(repeated=True)
   answer_deck = model.IntegerProperty(repeated=True)
   current_question = model.IntegerProperty()
@@ -14,10 +46,15 @@ class Game(model.Model):
   start_time = model.DateTimeProperty(required=True, auto_now_add=True)
   end_time = model.DateTimeProperty()
 
-  @property
-  def hangout_id(self):
-    return self.key().name()
-  
+  @classmethod
+  def new_game(cls, hangout):
+    return cls(
+        parent=hangout,
+        state='new',
+        question_deck=random.shuffle(range(len(cards.questions))),
+        answer_deck=random.shuffle(range(len(cards.answers))),
+    )
+
 
 class Participant(model.Model):
   # Child entity of the Game in which they are participating
@@ -33,7 +70,7 @@ class Participant(model.Model):
   @property
   def plus_id(self):
     """The user's Google+ ID."""
-    return self.key().name()
+    return self.key.name()
 
   @classmethod
   def get_participant(cls, game_key, plus_id):
