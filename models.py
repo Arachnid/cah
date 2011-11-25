@@ -34,6 +34,17 @@ class Hangout(model.Model):
       return game
     return model.transaction(_tx)
 
+  @classmethod
+  def start_new_game(cls, hangout_id):
+    """If there is a current game, set its end time.  Then create a new game,
+    using the participant list of the current game.
+    """
+    # placeholder- tbd.  
+    # perform in txn: set the end date of the current
+    # game and get its list of participant's plus ids.  Create the new game and
+    # its new particpant objects from the list of plus ids. 
+    pass
+
 
 class Game(model.Model):
   # Child entity of the hangout this game is in
