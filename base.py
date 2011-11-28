@@ -1,8 +1,7 @@
-# import uuid
 import webapp2
 from webapp2_extras import jinja2
 # from ndb import model
-# import logging
+import logging
 
 
 try:
@@ -20,9 +19,10 @@ class BaseHandler(webapp2.RequestHandler):
     self.response.write(body)
 
   def render_jsonp(self, response):
-    try:
-      cb = self.request.GET['callback']
-    except:
-      cb = ""
+    cb = self.request.GET.get('callback')
+    if not cb:
+      logging.warn("in render_jsonp, could not get callback URL.")
+      self.error(500)
+      return
     self.response.write("%s(%s);" % (cb,
                                      simplejson.dumps(response)))

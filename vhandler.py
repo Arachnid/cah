@@ -16,17 +16,24 @@ def calculate_and_send_scores(game_key):
   # yet-to-be-defined metrics.  This is run in a task.
   # does it need to be in a txn?
   game = game_key.get()
-  participants = models.Participant.query(
-      models.Participant.playing == True,
-      ancestor=game.key).fetch()
-  _calculate_scores(participants)
+  def _txn():
+    participants = models.Participant.query(
+        models.Participant.playing == True,
+        ancestor=game.key).fetch()
+    for p in participants:
+      # tbd: actual calculation
+      p.score = random.randint(1,10)
+    model.put_multi(participants)
+  model.transaction(_tx)
+  _send_scores(participants)
 
-def _calculate_scores(participants):
-  # tbd: actually calculate the scores
-  message = "these are your scores..."
+def _send_scores(participants):
+  # tbd
   for participant in participants:
+    message = "particpant %s got score %s" % (participant.key, participant.score)
+    logging.info("score message to %s: %s" % (participant, message))
     channel.send_message(
-        participant.channel_id, "%s: %s" % (participant.key, message,))
+        participant.channel_id, message)
 
 class VoteHandler(base.BaseHandler):
 
@@ -39,7 +46,7 @@ class VoteHandler(base.BaseHandler):
       models.Participant.playing == True,
       models.Participant.vote == None,
       ancestor=game.key).fetch()
-    logging.info("partipants who have not voted: ")
+    logging.info("partipants who have not voted: %s", participants)
     if participants:
       return False
     else:
@@ -70,8 +77,9 @@ class VoteHandler(base.BaseHandler):
       pvid = self.request.GET['pvote'] # the id of the player being voted for
       plus_id = self.request.GET['plus_id'] # the id of the player submitting 
           #the vote
-      participant_key = model.Key(models.Game, hangout_id,
-                                models.Participant, plus_id)
+      # logging.info("game key: %s", game.key)
+      participant_key = model.Key(models.Participant, plus_id, parent=game.key)
+      # logging.info("participant_key: %s", participant_key)                                
       participant = participant_key.get()
     except:
       self.render_jsonp(
@@ -79,12 +87,11 @@ class VoteHandler(base.BaseHandler):
       return
     if not participant:
       self.render_jsonp(
-          {'status': 'ERROR', 'message': "Voting info incomplete"})      
+          {'status': 'ERROR', 'message': "Could not retrieve indicated participant"})      
       return
     # otherwise, record the vote
     # TODO : also check that entity exists for this participant key?
-    vpkey = model.Key(models.Game, game.key,
-                                models.Participant, pvid)
+    vpkey = model.Key(models.Participant, pvid, parent=game.key)
     
     def _tx():
       participant.vote = vpkey
@@ -107,7 +114,7 @@ class VoteHandler(base.BaseHandler):
     # We can now start a new round.  If we've had N rounds, this is a new 
     # game instead.  
     # Can this be pushed to a task as well?
-    if game.current_round == model.ROUNDS_PER_GAME:
+    if game.current_round == models.ROUNDS_PER_GAME:
       # then start new game using the participants of the current game
       self.start_new_game(hangout_id)
     else:

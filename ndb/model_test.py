@@ -1,6 +1,5 @@
 """Tests for model.py."""
 
-import base64
 import datetime
 import difflib
 import pickle
@@ -12,9 +11,13 @@ from google.appengine.api import datastore_types
 from google.appengine.api import memcache
 from google.appengine.api import namespace_manager
 from google.appengine.api import users
-from google.appengine.datastore import entity_pb
 
-from . import model, query, tasklets, test_utils
+from . import eventloop
+from . import key
+from . import model
+from . import query
+from . import tasklets
+from . import test_utils
 
 TESTUSER = users.User('test@example.com', 'example.com', '123')
 AMSTERDAM = model.GeoPt(52.35, 4.9166667)
@@ -405,7 +408,7 @@ property <
 """
 
 
-class ModelTests(test_utils.DatastoreTest):
+class ModelTests(test_utils.NDBTest):
 
   def tearDown(self):
     self.assertTrue(model.Model._properties == {})
@@ -491,6 +494,26 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertRaises(datastore_errors.BadArgumentError, model.Model, key=k,
                       id='bar', parent=p)
 
+  def testAdapter(self):
+    class Foo(model.Model):
+      name = model.StringProperty()
+    ad = model.ModelAdapter()
+    foo1 = Foo(name='abc')
+    pb1 = ad.entity_to_pb(foo1)
+    foo2 = ad.pb_to_entity(pb1)
+    self.assertEqual(foo1, foo2)
+    self.assertTrue(foo2.key is None)
+    pb2 = foo2._to_pb(set_key=False)
+    self.assertRaises(model.KindError, ad.pb_to_entity, pb2)
+    ad = model.ModelAdapter(Foo)
+    foo3 = ad.pb_to_entity(pb2)
+    self.assertEqual(foo3, foo2)
+
+    key1 = model.Key(Foo, 1)
+    pbk1 = ad.key_to_pb(key1)
+    key2 = ad.pb_to_key(pbk1)
+    self.assertEqual(key1, key2)
+
   def testQuery(self):
     class MyModel(model.Model):
       p = model.IntegerProperty()
@@ -520,6 +543,63 @@ class ModelTests(test_utils.DatastoreTest):
 
     q2 = MyModel.query().filter(MyModel.p >= 0)
     self.assertEqual(q.filters, q2.filters)
+
+  def testQueryForNone(self):
+    class MyModel(model.Model):
+      b = model.BooleanProperty()
+      bb = model.BlobProperty(indexed=True)
+      d = model.DateProperty()
+      f = model.FloatProperty()
+      i = model.IntegerProperty()
+      k = model.KeyProperty()
+      s = model.StringProperty()
+      t = model.TimeProperty()
+      u = model.UserProperty()
+      xy = model.GeoPtProperty()
+    m1 = MyModel()
+    m1.put()
+    m2 = MyModel(
+      b=True,
+      bb='z',
+      d=datetime.date.today(),
+      f=3.14,
+      i=1,
+      k=m1.key,
+      s='a',
+      t=datetime.time(),
+      u=TESTUSER,
+      xy=AMSTERDAM,
+      )
+    m2.put()
+    q = MyModel.query(
+      MyModel.b == None,
+      MyModel.bb == None,
+      MyModel.d == None,
+      MyModel.f == None,
+      MyModel.i == None,
+      MyModel.k == None,
+      MyModel.s == None,
+      MyModel.t == None,
+      MyModel.u == None,
+      MyModel.xy == None,
+      )
+    r = q.fetch()
+    self.assertEqual(r, [m1])
+    qq = [
+      MyModel.query(MyModel.b != None),
+      MyModel.query(MyModel.bb != None),
+      MyModel.query(MyModel.d != None),
+      MyModel.query(MyModel.f != None),
+      MyModel.query(MyModel.i != None),
+      MyModel.query(MyModel.k != None),
+      MyModel.query(MyModel.s != None),
+      MyModel.query(MyModel.t != None),
+      MyModel.query(MyModel.u != None),
+      MyModel.query(MyModel.xy != None),
+      ]
+    for q in qq:
+      r = q.fetch()
+      self.assertEqual(r, [m2], str(q))
 
   def testProperty(self):
     class MyModel(model.Model):
@@ -688,6 +768,7 @@ class ModelTests(test_utils.DatastoreTest):
       self.assertRaises(Exception,
                         model.StringProperty,
                         repeated=True, required=True, default='')
+    self.assertEqual('MyModel()', repr(MyModel()))
 
   def testBlobKeyProperty(self):
     class MyModel(model.Model):
@@ -725,11 +806,16 @@ class ModelTests(test_utils.DatastoreTest):
       return value
     class MyModel(model.Model):
       a = model.StringProperty(validator=my_validator)
+      foos = model.StringProperty(validator=my_validator, repeated=True)
     m = MyModel()
     m.a = 'ABC'
     self.assertEqual(m.a, 'abc')
     self.assertRaises(datastore_errors.BadValueError,
                       setattr, m, 'a', 'def')
+    m.foos = ['ABC', 'ABC', 'ABC']
+    self.assertEqual(m.foos, ['abc', 'abc', 'abc'])
+    self.assertRaises(datastore_errors.BadValueError,
+                      setattr, m, 'foos', ['def'])
 
   def testUnindexedProperty(self):
     class MyModel(model.Model):
@@ -752,41 +838,105 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertEqual(MyModel.b._get_value(ent), '\x00\xff')
 
   def DateAndOrTimePropertyTest(self, propclass, t1, t2):
+    class ClockInOut(model.Model):
+      ctime = propclass(auto_now_add=True)
+      mtime = propclass(auto_now=True)
+
     class Person(model.Model):
       name = model.StringProperty()
       ctime = propclass(auto_now_add=True)
       mtime = propclass(auto_now=True)
       atime = propclass()
-      times =  propclass(repeated=True)
+      times = propclass(repeated=True)
+      struct = model.StructuredProperty(ClockInOut)
+      repstruct = model.StructuredProperty(ClockInOut, repeated=True)
+      localstruct = model.LocalStructuredProperty(ClockInOut)
+      replocalstruct = model.LocalStructuredProperty(ClockInOut, repeated=True)
 
-    p = Person()
+    p = Person(id=1, struct=ClockInOut(), repstruct=[ClockInOut()],
+               localstruct=ClockInOut(), replocalstruct=[ClockInOut()])
     p.atime = t1
     p.times = [t1, t2]
     self.assertEqual(p.ctime, None)
     self.assertEqual(p.mtime, None)
-    pb = p._to_pb()
+    self.assertEqual(p.struct.ctime, None)
+    self.assertEqual(p.struct.mtime, None)
+    self.assertEqual(p.repstruct[0].ctime, None)
+    self.assertEqual(p.repstruct[0].mtime, None)
+    self.assertEqual(p.localstruct.ctime, None)
+    self.assertEqual(p.localstruct.mtime, None)
+    self.assertEqual(p.replocalstruct[0].ctime, None)
+    self.assertEqual(p.replocalstruct[0].mtime, None)
+    p.put()
     self.assertNotEqual(p.ctime, None)
     self.assertNotEqual(p.mtime, None)
+    self.assertNotEqual(p.struct.ctime, None)
+    self.assertNotEqual(p.struct.mtime, None)
+    self.assertNotEqual(p.repstruct[0].ctime, None)
+    self.assertNotEqual(p.repstruct[0].mtime, None)
+    self.assertNotEqual(p.localstruct.ctime, None)
+    self.assertNotEqual(p.localstruct.mtime, None)
+    self.assertNotEqual(p.replocalstruct[0].ctime, None)
+    self.assertNotEqual(p.replocalstruct[0].mtime, None)
+    pb = p._to_pb()
     q = Person._from_pb(pb)
     self.assertEqual(q.ctime, p.ctime)
     self.assertEqual(q.mtime, p.mtime)
+    self.assertEqual(q.struct.ctime, p.struct.ctime)
+    self.assertEqual(q.struct.mtime, p.struct.mtime)
+    self.assertEqual(q.repstruct[0].ctime, p.repstruct[0].ctime)
+    self.assertEqual(q.repstruct[0].mtime, p.repstruct[0].mtime)
+    self.assertEqual(q.localstruct.ctime, p.localstruct.ctime)
+    self.assertEqual(q.localstruct.mtime, p.localstruct.mtime)
+    self.assertEqual(q.replocalstruct[0].ctime, p.replocalstruct[0].ctime)
+    self.assertEqual(q.replocalstruct[0].mtime, p.replocalstruct[0].mtime)
     self.assertEqual(q.atime, t1)
     self.assertEqual(q.times, [t1, t2])
 
+  def PrepareForPutTests(self, propclass):
+    class AuditedRecord(model.Model):
+      created = propclass(auto_now_add=True)
+      modified = propclass(auto_now=True)
+    record = AuditedRecord(id=1)
+    record._to_pb()
+    self.assertEqual(record.created, None,
+                     'auto_now_add set before entity was put')
+    self.assertEqual(record.modified, None,
+                     'auto_now set before entity was put')
+
+  def MultiDateAndOrTimePropertyTest(self, *args):
+    ctx = tasklets.get_context()
+
+    # Run tests against datastore
+    self.DateAndOrTimePropertyTest(*args)
+    self.PrepareForPutTests(args[0])
+    ctx.set_datastore_policy(False)
+
+    # Run tests against memcache
+    ctx.set_memcache_policy(True)
+    self.DateAndOrTimePropertyTest(*args)
+    self.PrepareForPutTests(args[0])
+    ctx.set_memcache_policy(False)
+
+    # Run tests against process cache
+    ctx.set_cache_policy(True)
+    self.DateAndOrTimePropertyTest(*args)
+    self.PrepareForPutTests(args[0])
+
   def testDateTimeProperty(self):
-    self.DateAndOrTimePropertyTest(model.DateTimeProperty,
-                                   datetime.datetime(1982, 12, 1, 9, 0, 0),
-                                   datetime.datetime(1995, 4, 15, 5, 0, 0))
+    self.MultiDateAndOrTimePropertyTest(model.DateTimeProperty,
+                                        datetime.datetime(1982, 12, 1, 9, 0, 0),
+                                        datetime.datetime(1995, 4, 15, 5, 0, 0))
 
   def testDateProperty(self):
-    self.DateAndOrTimePropertyTest(model.DateProperty,
-                                   datetime.date(1982, 12, 1),
-                                   datetime.date(1995, 4, 15))
+    self.MultiDateAndOrTimePropertyTest(model.DateProperty,
+                                        datetime.date(1982, 12, 1),
+                                        datetime.date(1995, 4, 15))
 
   def testTimeProperty(self):
-    self.DateAndOrTimePropertyTest(model.TimeProperty,
-                                   datetime.time(9, 0, 0),
-                                   datetime.time(5, 0, 0, 500))
+    self.MultiDateAndOrTimePropertyTest(model.TimeProperty,
+                                        datetime.time(9, 0, 0),
+                                        datetime.time(5, 0, 0, 500))
 
   def testStructuredProperty(self):
     class Address(model.Model):
@@ -843,6 +993,28 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertEqual(p.address.home.city, 'Mountain View')
     self.assertEqual(p.address.work.street, '345 Spear')
     self.assertEqual(p.address.work.city, 'San Francisco')
+
+  def testRepeatedNestedStructuredProperty(self):
+    class Person(model.Model):
+      first_name = model.StringProperty()
+      last_name = model.StringProperty()
+    class PersonPhone(model.Model):
+      person = model.StructuredProperty(Person)
+      phone = model.StringProperty()
+    class Phonebook(model.Model):
+      numbers = model.StructuredProperty(PersonPhone, repeated=True)
+
+    book = Phonebook.get_or_insert('test')
+    person = Person(first_name="John", last_name='Smith')
+    phone = PersonPhone(person=person, phone='1-212-555-1212')
+    book.numbers.append(phone)
+    pb = book._to_pb()
+
+    ent = Phonebook._from_pb(pb)
+    self.assertEqual(ent.numbers[0].person.first_name, 'John')
+    self.assertEqual(len(ent.numbers), 1)
+    self.assertEqual(ent.numbers[0].person.last_name, 'Smith')
+    self.assertEqual(ent.numbers[0].phone, '1-212-555-1212')
 
   def testRecursiveStructuredProperty(self):
     class Node(model.Model):
@@ -1000,7 +1172,7 @@ class ModelTests(test_utils.DatastoreTest):
     m2 = Person._from_pb(pb)
     self.assertEqual(m2, m)
 
-  def testMultipleStructuredProperty(self):
+  def testMultipleStructuredPropertyProtocolBuffers(self):
     class Address(model.Model):
       label = model.StringProperty()
       text = model.StringProperty()
@@ -1025,14 +1197,14 @@ class ModelTests(test_utils.DatastoreTest):
   def testCannotMultipleInMultiple(self):
     class Inner(model.Model):
       innerval = model.StringProperty(repeated=True)
-    self.assertRaises(AssertionError,
+    self.assertRaises(TypeError,
                       model.StructuredProperty, Inner, repeated=True)
 
   def testNullProperties(self):
     class Address(model.Model):
       street = model.StringProperty()
       city = model.StringProperty()
-      zip = model.IntegerProperty()
+      zipcode = model.IntegerProperty()
     class Person(model.Model):
       address = model.StructuredProperty(Address)
       age = model.IntegerProperty()
@@ -1060,7 +1232,7 @@ class ModelTests(test_utils.DatastoreTest):
     class Address(model.Model):
       line = model.StringProperty(repeated=True)
       city = model.StringProperty()
-      zip = model.IntegerProperty()
+      zipcode = model.IntegerProperty()
       tags = model.StructuredProperty(Tag)
     class Person(model.Model):
       address = model.StructuredProperty(Address)
@@ -1071,7 +1243,7 @@ class ModelTests(test_utils.DatastoreTest):
     p = Person(name='White House', k=k, age=[210, 211],
                address=Address(line=['1600 Pennsylvania', 'Washington, DC'],
                                tags=Tag(names=['a', 'b'], ratings=[1, 2]),
-                               zip=20500))
+                               zipcode=20500))
     p.key = k
     pb = p._to_pb()
     q = model.Model._from_pb(pb)
@@ -1080,6 +1252,20 @@ class ModelTests(test_utils.DatastoreTest):
     linesq = str(qb).splitlines(True)
     lines = difflib.unified_diff(linesp, linesq, 'Expected', 'Actual')
     self.assertEqual(pb, qb, ''.join(lines))
+
+  def testMetaModelRepr(self):
+    class MyModel(model.Model):
+      name = model.StringProperty()
+      tags = model.StringProperty(repeated=True)
+      age = model.IntegerProperty(name='a')
+      other = model.KeyProperty()
+    self.assertEqual(repr(MyModel),
+                     "MyModel<"
+                     "age=IntegerProperty('a'), "
+                     "name=StringProperty('name'), "
+                     "other=KeyProperty('other'), "
+                     "tags=StringProperty('tags', repeated=True)"
+                     ">")
 
   def testModelPickling(self):
     global MyModel
@@ -1103,13 +1289,13 @@ class ModelTests(test_utils.DatastoreTest):
     dumped = []
     for proto in 0, 1, 2:
       x = MyModel()
-      s = pickle.dumps(x)
+      s = pickle.dumps(x, proto)
       dumped.append(s)
       x.name = 'joe'
-      s = pickle.dumps(x)
+      s = pickle.dumps(x, proto)
       dumped.append(s)
       db.put(x)
-      s = pickle.dumps(x)
+      s = pickle.dumps(x, proto)
       dumped.append(s)
     class MyModel(model.Model):
       name = model.StringProperty()
@@ -1197,6 +1383,19 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertEqual(p._values,
                      {'foo': 'bar', 'bar': 'foo', 'baz': 'baz'})
 
+  def testExpando_Repr(self):
+    class E(model.Expando):
+      pass
+    ent = E(a=1, b=[2], c=E(x=3, y=[4]))
+    self.assertEqual(repr(ent),
+                     "E(a=1, b=[2], c=E(x=3, y=[4]))")
+    pb = ent._to_pb(set_key=False)
+    ent2 = E._from_pb(pb)
+    # NOTE: The 'E' kind name for the inner instance is not persisted,
+    # so it comes out as Expando.
+    self.assertEqual(repr(ent2),
+                     "E(a=1, b=[2], c=Expando(x=3, y=[4]))")
+
   def testPropertyRepr(self):
     p = model.Property()
     self.assertEqual(repr(p), 'Property()')
@@ -1230,9 +1429,9 @@ class ModelTests(test_utils.DatastoreTest):
       structp = model.StructuredProperty(Address)
       localstructp = model.LocalStructuredProperty(Address)
       genp = model.GenericProperty()
-      compp = model.ComputedProperty(lambda e: 'x')
+      compp = model.ComputedProperty(lambda _: 'x')
     self.assertEqual(repr(MyModel.key), "ModelKey('__key__')")
-    for name, prop in MyModel._properties.iteritems():
+    for prop in MyModel._properties.itervalues():
       s = repr(prop)
       self.assertTrue(s.startswith(prop.__class__.__name__ + '('), s)
 
@@ -1521,7 +1720,7 @@ class ModelTests(test_utils.DatastoreTest):
       name = model.StringProperty('Name')
       city = model.StringProperty('City')
     p = Person(name='Guido', zip='00000')
-    p.city= 'SF'
+    p.city = 'SF'
     self.assertEqual(repr(p),
                      "Person(city='SF', name='Guido', zip='00000')")
     # White box confirmation.
@@ -1595,7 +1794,7 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertFalse(a._properties['baz']._indexed)
     Mine._default_indexed = False
     b = Mine(foo=1)
-    b.bar=['a', 'b']
+    b.bar = ['a', 'b']
     self.assertFalse(b._properties['foo']._indexed)
     self.assertFalse(b._properties['bar']._indexed)
 
@@ -1610,9 +1809,10 @@ class ModelTests(test_utils.DatastoreTest):
 
       def _compute_hash(self):
         return hash(self.name)
-      hash = model.ComputedProperty(_compute_hash, name='hashcode')
+      computed_hash = model.ComputedProperty(_compute_hash, name='hashcode')
 
     m = ComputedTest(name='Foobar')
+    m._prepare_for_put()
     pb = m._to_pb()
 
     for p in pb.property_list():
@@ -1626,7 +1826,43 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertEqual(m.name, 'Foobar')
     self.assertEqual(m.name_lower, 'foobar')
     self.assertEqual(m.length, 6)
-    self.assertEqual(m.hash, hash('Foobar'))
+    self.assertEqual(m.computed_hash, hash('Foobar'))
+
+    func = lambda unused_ent: None
+    self.assertRaises(TypeError, model.ComputedProperty, func,
+                      choices=('foo', 'bar'))
+    self.assertRaises(TypeError, model.ComputedProperty, func, default='foo')
+    self.assertRaises(TypeError, model.ComputedProperty, func, required=True)
+    self.assertRaises(TypeError, model.ComputedProperty, func, validator=func)
+
+  def testComputedPropertyRepeated(self):
+    class StopWatch(model.Model):
+      start = model.IntegerProperty()
+      end = model.IntegerProperty()
+      cp = model.ComputedProperty(lambda self: range(self.start, self.end),
+                                   repeated=True)
+    e = StopWatch(start=1, end=10)
+    self.assertEqual(e.cp, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+    k = e.put()
+    self.assertEqual(k.get().cp, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+    # Check that the computed property works when retrieved without cache
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    ctx.set_memcache_policy(False)
+    self.assertEqual(k.get().cp, [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+  def testComputedPropertyInRepeatedStructuredProperty(self):
+    class Inner(model.Model):
+      arg = model.IntegerProperty()
+      comp1 = model.ComputedProperty(lambda ent: 1)
+      comp2 = model.ComputedProperty(lambda ent: 2)
+    class Outer(model.Model):
+      wrap = model.StructuredProperty(Inner, repeated=True)
+    orig = Outer(wrap=[Inner(arg=1), Inner(arg=2)])
+    key = orig.put()
+    copy = Outer.query().get()
+    self.assertEqual(copy, orig)
 
   def testLargeValues(self):
     class Demo(model.Model):
@@ -1639,7 +1875,7 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertTrue(isinstance(y.bytes, str))
     self.assertTrue(isinstance(y.text, unicode))
 
-  def testMultipleStructuredProperty(self):
+  def testMultipleStructuredPropertyDatastore(self):
     class Address(model.Model):
       label = model.StringProperty()
       text = model.StringProperty()
@@ -1707,25 +1943,25 @@ class ModelTests(test_utils.DatastoreTest):
 
     # key id
     ent1 = MyModel(key=model.Key(pairs=[(kind, 1)]))
-    key = ent1.put()
+    ent1.put()
     res = MyModel.get_by_id(1)
     self.assertEqual(res, ent1)
 
     # key name
     ent2 = MyModel(key=model.Key(pairs=[(kind, 'foo')]))
-    key = ent2.put()
+    ent2.put()
     res = MyModel.get_by_id('foo')
     self.assertEqual(res, ent2)
 
     # key id + parent
     ent3 = MyModel(key=model.Key(pairs=[(kind, 1), (kind, 2)]))
-    key = ent3.put()
+    ent3.put()
     res = MyModel.get_by_id(2, parent=model.Key(pairs=[(kind, 1)]))
     self.assertEqual(res, ent3)
 
     # key name + parent
     ent4 = MyModel(key=model.Key(pairs=[(kind, 1), (kind, 'bar')]))
-    key = ent4.put()
+    ent4.put()
     res = MyModel.get_by_id('bar', parent=ent1.key)
     self.assertEqual(res, ent4)
 
@@ -1790,7 +2026,7 @@ class ModelTests(test_utils.DatastoreTest):
 
     key = model.Key(MyModel, 'bababaz')
     self.assertEqual(key.get(), None)
-    c = model.transaction(callback, retry=0, entity_group=key)
+    c = model.transaction(callback, retries=0)
     self.assertNotEqual(c, None)
     self.assertEqual(c.text, 'baz')
     self.assertEqual(key.get(), c)
@@ -1863,7 +2099,7 @@ class ModelTests(test_utils.DatastoreTest):
         ents = yield model.delete_multi_async([key1, key2, key3])
         raise tasklets.Return(ents)
 
-    res = foo().get_result()
+    foo().get_result()
     self.assertEqual(key1.get(), None)
     self.assertEqual(key2.get(), None)
     self.assertEqual(key3.get(), None)
@@ -1881,7 +2117,7 @@ class ModelTests(test_utils.DatastoreTest):
     self.assertEqual(key2.get(), ent2)
     self.assertEqual(key3.get(), ent3)
 
-    res = model.delete_multi((key1, key2, key3))
+    model.delete_multi((key1, key2, key3))
 
     self.assertEqual(key1.get(), None)
     self.assertEqual(key2.get(), None)
@@ -1897,12 +2133,13 @@ class ModelTests(test_utils.DatastoreTest):
       name = model.StringProperty()
     key = model.Key(MyModel, 'yo')
     ent = MyModel(key=key, name='yo')
-    ent.put()
+    ent.put(use_memcache=False)  # Don't lock memcache.
     key.get(use_cache=False)  # Write to memcache.
+    eventloop.run()  # Wait for async memcache request to complete.
     # Verify that it is in both caches.
     self.assertTrue(ctx._cache[key] is ent)
     self.assertEqual(memcache.get(ctx._memcache_prefix + key.urlsafe()),
-                     ent._to_pb())
+                     ent._to_pb(set_key=False).SerializePartialToString())
     # Get it bypassing the in-process cache.
     ent_copy = key.get(use_cache=False)
     self.assertEqual(ent_copy, ent)
@@ -1938,7 +2175,7 @@ class ModelTests(test_utils.DatastoreTest):
     ent6 = key.get(use_cache=False)
     self.assertEqual(ent6.name, 'yo')
     self.assertEqual(memcache.get(ctx._memcache_prefix + key.urlsafe()),
-                     ent._to_pb())
+                     ent._to_pb(set_key=False).SerializePartialToString())
     # Assure it is still in the in-memory cache.
     ent7 = key.get()
     self.assertEqual(ent7.name, 'yo')
@@ -1964,12 +2201,12 @@ class ModelTests(test_utils.DatastoreTest):
     ctx.set_cache_policy(True)
     ctx.set_memcache_policy(True)
     ctx.set_memcache_timeout_policy(0)
-    # Mock memcache.add_multi().
-    save_memcache_add_multi = memcache.add_multi
+    # Mock memcache.cas_multi_async().
+    save_memcache_cas_multi_async = ctx._memcache.cas_multi_async
     memcache_args_log = []
-    def mock_memcache_add_multi(*args, **kwds):
+    def mock_memcache_cas_multi_async(*args, **kwds):
       memcache_args_log.append((args, kwds))
-      return save_memcache_add_multi(*args, **kwds)
+      return save_memcache_cas_multi_async(*args, **kwds)
     # Mock conn.async_put().
     save_conn_async_put = ctx._conn.async_put
     conn_args_log = []
@@ -1986,7 +2223,7 @@ class ModelTests(test_utils.DatastoreTest):
     e5 = MyModel(name='5')
     # Test that the timeouts make it through to memcache and the datastore.
     try:
-      memcache.add_multi = mock_memcache_add_multi
+      ctx._memcache.cas_multi_async = mock_memcache_cas_multi_async
       ctx._conn.async_put = mock_conn_async_put
       [f1, f3] = model.put_multi_async([e1, e3],
                                        memcache_timeout=7,
@@ -2002,13 +2239,15 @@ class ModelTests(test_utils.DatastoreTest):
       model.get_multi([x1, x3], use_cache=False, memcache_timeout=7)
       model.get_multi([x4], use_cache=False)
       model.get_multi([x2, x5], use_cache=False, memcache_timeout=5)
+      eventloop.run()  # Wait for async memcache request to complete.
+      # (And there are straggler events too, but they don't matter here.)
     finally:
-      memcache.add_multi = save_memcache_add_multi
+      ctx._memcache.cas_multi_async = save_memcache_cas_multi_async
       ctx._conn.async_put = save_conn_async_put
     self.assertEqual([e1.key, e2.key, e3.key, e4.key, e5.key],
                      [x1, x2, x3, x4, x5])
-    self.assertEqual(len(memcache_args_log), 3)
-    timeouts = set(kwds['time'] for args, kwds in memcache_args_log)
+    self.assertEqual(len(memcache_args_log), 3, memcache_args_log)
+    timeouts = set(kwds['time'] for _, kwds in memcache_args_log)
     self.assertEqual(timeouts, set([0, 5, 7]))
     self.assertEqual(len(conn_args_log), 3)
     deadlines = set(args[0]._values.get('deadline')
@@ -2035,7 +2274,8 @@ class ModelTests(test_utils.DatastoreTest):
     c.put(use_cache=False, use_memcache=False, use_datastore=True)
 
     self.assertEqual(ctx._cache[k], a)
-    self.assertEqual(memcache.get('NDB:' + k.urlsafe()), b._to_pb())
+    self.assertEqual(memcache.get(ctx._memcache_prefix + k.urlsafe()),
+                     b._to_pb(set_key=False).SerializePartialToString())
     self.assertEqual(ctx._conn.get([k]), [c])
 
     self.assertEqual(k.get(), a)
@@ -2074,8 +2314,9 @@ class ModelTests(test_utils.DatastoreTest):
 
     self.assertFalse(a.key in ctx._cache)
     self.assertFalse(b.key in ctx._cache)
-    self.assertEqual(memcache.get('NDB:' + a.key.urlsafe()), a._to_pb())
-    self.assertEqual(memcache.get('NDB:' + b.key.urlsafe()), None)
+    self.assertEqual(memcache.get(ctx._memcache_prefix + a.key.urlsafe()),
+                     a._to_pb(set_key=False).SerializePartialToString())
+    self.assertEqual(memcache.get(ctx._memcache_prefix + b.key.urlsafe()), None)
     self.assertEqual(ctx._conn.get([a.key]), [None])
     self.assertEqual(ctx._conn.get([b.key]), [b])
 
@@ -2132,13 +2373,13 @@ class ModelTests(test_utils.DatastoreTest):
 
   def testOverrideModelKey(self):
     class MyModel(model.Model):
-      # key, overriden
+      # key, overridden
       key = model.StringProperty()
       # aha, here it is!
       real_key = model.ModelKey()
 
     class MyExpando(model.Expando):
-      # key, overriden
+      # key, overridden
       key = model.StringProperty()
       # aha, here it is!
       real_key = model.ModelKey()
@@ -2355,20 +2596,222 @@ class ModelTests(test_utils.DatastoreTest):
       b = model.BlobProperty(compressed=True)
       t = model.TextProperty(compressed=True)
       l = model.LocalStructuredProperty(Foo, compressed=True)
-    x = M(b='b'*100, t=u't'*100, l=Foo(name='joe'))
+    x = M(b='b' * 100, t=u't' * 100, l=Foo(name='joe'))
     x.put()
     y = x.key.get()
     self.assertFalse(x is y)
     self.assertEqual(
       repr(y),
-      'M(key=Key(\'M\', 1), '
-      'b=_CompressedValue(\'x\\x9cKJ\\xa2=\\x00\\x00\\x8e\\x01&I\'), '
-      'l=_CompressedValue(\'x\\x9c+\\xe2\\x97b\\xc9K\\xccMU`\\xd0b'
-      '\\x95b\\xce\\xcaO\\x05\\x00"\\x87\\x03\\xeb\'), '
-      't=_CompressedValue(\'x\\x9c+)\\xa1=\\x00\\x00\\xf1$-Q\'))')
+      'M(key=Key(\'M\', 1), ' +
+      'b=%r, ' % ('b' * 100) +
+      'l=%r, ' % Foo(name=u'joe') +
+      't=%r)' % (u't' * 100))
 
+  def testCorruption(self):
+    # Thanks to Ricardo Banffy
+    class Evil(model.Model):
+      x = model.IntegerProperty()
+      def __init__(self, *a, **k):
+        super(Evil, self).__init__(*a, **k)
+        self.x = 42
+    e = Evil()
+    e.x = 50
+    pb = e._to_pb()
+    y = Evil._from_pb(pb)
+    self.assertEqual(y.x, 50)
 
-class CacheTests(test_utils.DatastoreTest):
+  def testAllocateIdsHooksCalled(self):
+    self.pre_counter = 0
+    self.post_counter = 0
+
+    self.size = 25
+    self.max = None
+    self.parent = key.Key('Foo', 'Bar')
+
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_allocate_ids_hook(cls, size, max, parent):
+        self.pre_counter += 1
+        self.assertEqual(size, self.size)
+        self.assertEqual(max, self.max)
+        self.assertEqual(parent, self.parent)
+      @classmethod
+      def _post_allocate_ids_hook(cls, size, max, parent, future):
+        self.post_counter += 1
+        self.assertEqual(size, self.size)
+        self.assertEqual(max, self.max)
+        self.assertEqual(parent, self.parent)
+        low, high = future.get_result()
+        self.assertEqual(high - low + 1, self.size)
+
+    self.assertEqual(self.pre_counter, 0, 'Pre allocate ids hook called early')
+    future = HatStand.allocate_ids_async(size=self.size, max=self.max,
+                                         parent=self.parent)
+    self.assertEqual(self.pre_counter, 1, 'Pre allocate ids hook not called')
+    self.assertEqual(self.post_counter, 0,
+                     'Post allocate ids hook called early')
+    future.get_result()
+    self.assertEqual(self.post_counter, 1, 'Post allocate ids hook not called')
+
+  def testNoDefaultAllocateIdsCallback(self):
+    # See issue 58.  http://goo.gl/hPN6j
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    class EmptyModel(model.Model):
+      pass
+    fut = EmptyModel.allocate_ids_async(1)
+    self.assertFalse(fut._immediate_callbacks,
+                     'Allocate ids hook queued default no-op.')
+
+  def testPutHooksCalled(self):
+    test = self # Closure for inside hooks
+    self.pre_counter = 0
+    self.post_counter = 0
+
+    class HatStand(model.Model):
+      def _pre_put_hook(self):
+        test.pre_counter += 1
+      def _post_put_hook(self, future):
+        test.post_counter += 1
+        test.assertEqual(future.get_result(), test.entity.key)
+
+    furniture = HatStand()
+    self.entity = furniture
+    self.assertEqual(self.pre_counter, 0, 'Pre put hook called early')
+    future = furniture.put_async()
+    self.assertEqual(self.pre_counter, 1, 'Pre put hook not called')
+    self.assertEqual(self.post_counter, 0, 'Post put hook called early')
+    future.get_result()
+    self.assertEqual(self.post_counter, 1, 'Post put hook not called')
+
+    # All counters now read 1, calling put_multi for 10 entities makes this 11
+    new_furniture = [HatStand() for _ in range(10)]
+    multi_future = model.put_multi_async(new_furniture)
+    self.assertEqual(self.pre_counter, 11,
+                     'Pre put hooks not called on put_multi')
+    self.assertEqual(self.post_counter, 1,
+                     'Post put hooks called early on put_multi')
+    for fut, ent in zip(multi_future, new_furniture):
+      self.entity = ent
+      fut.get_result()
+    self.assertEqual(self.post_counter, 11,
+                     'Post put hooks not called on put_multi')
+
+  def testMonkeyPatchHooks(self):
+    test = self # Closure for inside put hooks
+    hook_attr_names = ('_pre_allocate_ids_hook', '_post_allocate_ids_hook',
+                       '_pre_put_hook', '_post_put_hook')
+    original_hooks = {}
+
+    # Backup the original hooks
+    for name in hook_attr_names:
+      original_hooks[name] = getattr(model.Model, name)
+
+    self.pre_allocate_ids_flag = False
+    self.post_allocate_ids_flag = False
+    self.pre_put_flag = False
+    self.post_put_flag = False
+
+    # TODO: Should the unused arguments to Monkey Patched tests be tested?
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_allocate_ids_hook(cls, unused_size, unused_max, unused_parent):
+        self.pre_allocate_ids_flag = True
+      @classmethod
+      def _post_allocate_ids_hook(cls, unused_size, unused_max, unused_parent,
+                                  unused_future):
+        self.post_allocate_ids_flag = True
+      def _pre_put_hook(self):
+        test.pre_put_flag = True
+      def _post_put_hook(self, unused_future):
+        test.post_put_flag = True
+
+    # Monkey patch the hooks
+    for name in hook_attr_names:
+      hook = getattr(HatStand, name)
+      setattr(model.Model, name, hook)
+
+    try:
+      HatStand.allocate_ids(1)
+      self.assertTrue(self.pre_allocate_ids_flag,
+               'Pre allocate ids hook not called when model is monkey patched')
+      self.assertTrue(self.post_allocate_ids_flag,
+              'Post allocate ids hook not called when model is monkey patched')
+      furniture = HatStand()
+      furniture.put()
+      self.assertTrue(self.pre_put_flag,
+                      'Pre put hook not called when model is monkey patched')
+      self.assertTrue(self.post_put_flag,
+                      'Post put hook not called when model is monkey patched')
+    finally:
+      # Restore the original hooks
+      for name in hook_attr_names:
+        setattr(model.Model, name, original_hooks[name])
+
+  def testPreHooksCannotCancelRPC(self):
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_allocate_ids_hook(cls, unused_size, unused_max, unused_parent):
+        raise tasklets.Return()
+      def _pre_put_hook(self):
+        raise tasklets.Return()
+    self.assertRaises(tasklets.Return, HatStand.allocate_ids)
+    entity = HatStand()
+    self.assertRaises(tasklets.Return, entity.put)
+
+  def testNoDefaultPutCallback(self):
+    # See issue 58.  http://goo.gl/hPN6j
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    class EmptyModel(model.Model):
+      pass
+    entity = EmptyModel()
+    fut = entity.put_async()
+    self.assertFalse(fut._immediate_callbacks, 'Put hook queued default no-op.')
+
+  def testKeyValidation(self):
+    # See issue 75.  http://goo.gl/k0Gfv
+    class Foo(model.Model):
+      # Override the default Model method with our own.
+      def _validate_key(self, key):
+        if key.parent() is None:
+          raise TypeError
+        elif key.parent().kind() != 'Foo':
+          raise TypeError
+        elif key.id().startswith('a'):
+          raise ValueError
+        return key
+
+    # Using no arguments
+    self.assertRaises(TypeError, Foo().put)
+
+    # Using id/parent arguments
+    rogue_parent = model.Key('Bar', 1)
+    self.assertRaises(TypeError, Foo, parent=rogue_parent, id='b')
+    parent = model.Key(Foo, 1)
+    self.assertRaises(ValueError, Foo, parent=parent, id='a')
+
+    # Using key argument
+    rogue_key = model.Key(Foo, 1, Foo, 'a')
+    self.assertRaises(ValueError, Foo, key=rogue_key)
+
+    # Using Key assignment
+    entity = Foo()
+    self.assertRaises(ValueError, setattr, entity, 'key', rogue_key)
+
+    # None assignment (including delete) should work correctly
+    entity.key = None
+    self.assertTrue(entity.key is None)
+    del entity.key
+    self.assertTrue(entity.key is None)
+
+    # Sanity check a valid key
+    key = Foo(parent=parent, id='b').put()
+    self.assertEqual(key.parent(), parent)
+    self.assertEqual(key.id(), 'b')
+    self.assertEqual(key.kind(), 'Foo')
+
+class CacheTests(test_utils.NDBTest):
 
   def SetupContextCache(self):
     """Set up the context cache.
@@ -2377,17 +2820,19 @@ class CacheTests(test_utils.DatastoreTest):
     is to disable it to avoid misleading test results. Override this when
     needed.
     """
-    ctx = tasklets.get_context()
-    ctx.set_cache_policy(lambda key: True)
-    ctx.set_memcache_policy(lambda key: True)
+    ctx = tasklets.make_default_context()
+    tasklets.set_context(ctx)
+    ctx.set_cache_policy(True)
+    ctx.set_memcache_policy(True)
 
-  def test_issue_13(self):
+  def testCachedEntityKeyMatchesGetArg(self):
+    # See issue 13.  http://goo.gl/jxjOP
     class Employee(model.Model):
       pass
 
     e = Employee(key=model.Key(Employee, 'joe'))
     e.put()
-    e.key = model.Key(Employee, 'fred')
+    e._key = model.Key(Employee, 'fred')
 
     f = model.Key(Employee, 'joe').get()
 
@@ -2398,6 +2843,38 @@ class CacheTests(test_utils.DatastoreTest):
     # Removing key from context cache when it is set to a different one
     # makes the test correct.
     self.assertEqual(f.key, model.Key(Employee, 'joe'))
+
+  def testTransactionalDeleteClearsCache(self):
+    # See issue 57.  http://goo.gl/bXkib
+    class Employee(model.Model):
+      pass
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(True)
+    ctx.set_memcache_policy(False)
+    e = Employee()
+    key = e.put()
+    key.get()  # Warm the cache
+    def trans():
+      key.delete()
+    model.transaction(trans)
+    e = key.get()
+    self.assertEqual(e, None)
+
+  def testTransactionalDeleteClearsMemcache(self):
+    # See issue 57.  http://goo.gl/bXkib
+    class Employee(model.Model):
+      pass
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    ctx.set_memcache_policy(True)
+    e = Employee()
+    key = e.put()
+    key.get()  # Warm the cache
+    def trans():
+      key.delete()
+    model.transaction(trans)
+    e = key.get()
+    self.assertEqual(e, None)
 
 
 def main():

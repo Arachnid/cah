@@ -132,12 +132,10 @@ import sys
 
 from google.appengine.api import datastore_errors
 from google.appengine.api import datastore_types
-from google.appengine.datastore import datastore_pb
 from google.appengine.datastore import datastore_query
 from google.appengine.datastore import datastore_rpc
 from google.appengine.ext import gql
 
-from . import context
 from . import model
 from . import tasklets
 
@@ -158,7 +156,7 @@ _KEY = datastore_types._KEY_SPECIAL_PROPERTY
 _OPS = frozenset(['=', '!=', '<', '<=', '>', '>=', 'in'])
 
 # Default limit value.  (Yes, the datastore uses int32!)
-_MAX_LIMIT = 2**31 - 1
+_MAX_LIMIT = 2 ** 31 - 1
 
 
 # TODO: Once CL/21689469 is submitted, get rid of this and its callers.
@@ -188,7 +186,9 @@ class RepeatedStructuredPropertyPredicate(datastore_query.FilterPredicate):
     self.match_keys = match_keys
     stripped_keys = []
     for key in match_keys:
-      assert key.startswith(key_prefix), key
+      if not key.startswith(key_prefix):
+        raise ValueError('key %r does not begin with the specified prefix of %s'
+                         % (key, key_prefix))
       stripped_keys.append(key[len(key_prefix):])
     value_map = _make_unsorted_key_value_map(pb, stripped_keys)
     self.match_values = tuple(value_map[key][0] for key in stripped_keys)
@@ -282,7 +282,8 @@ class Binding(object):
   def resolve(self):
     """Return the value currently associated with this Binding."""
     value = self.value
-    assert not isinstance(value, Binding), 'Recursive Binding'
+    if isinstance(value, Binding):
+      raise RuntimeError('Recursive Binding.')
     return value
 
 
@@ -296,7 +297,8 @@ class Node(object):
   """
 
   def __new__(cls):
-    assert cls is not Node, 'Cannot instantiate Node, only a subclass'
+    if cls is Node:
+      raise TypeError('Cannot instantiate Node, only a subclass.')
     return super(Node, cls).__new__(cls)
 
   def __eq__(self, other):
@@ -308,7 +310,7 @@ class Node(object):
       eq = not eq
     return eq
 
-  def __unordered(self, other):
+  def __unordered(self, unused_other):
     raise TypeError('Nodes cannot be ordered')
   __le__ = __lt__ = __ge__ = __gt__ = __unordered
 
@@ -336,7 +338,7 @@ class FalseNode(Node):
       return NotImplemented
     return True
 
-  def _to_filter(self, bindings, post=False):
+  def _to_filter(self, unused_bindings, post=False):
     if post:
       return None
     # Because there's no point submitting a query that will never
@@ -357,7 +359,9 @@ class FilterNode(Node):
       n2 = FilterNode(name, '>', value)
       return DisjunctionNode(n1, n2)
     if opsymbol == 'in' and not isinstance(value, Binding):
-      assert isinstance(value, (list, tuple, set, frozenset)), repr(value)
+      if not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError('in expected a list, tuple or set of values; '
+                        'received %r' % value)
       nodes = [FilterNode(name, '=', v) for v in value]
       if not nodes:
         return FalseNode()
@@ -371,7 +375,7 @@ class FilterNode(Node):
     return self
 
   def _sort_key(self):
-    return (self.__name, self.__opsymbol, self.__value)
+    return self.__name, self.__opsymbol, self.__value
 
   def __repr__(self):
     return '%s(%r, %r, %r)' % (self.__class__.__name__,
@@ -390,7 +394,10 @@ class FilterNode(Node):
   def _to_filter(self, bindings, post=False):
     if post:
       return None
-    assert self.__opsymbol not in ('!=', 'in'), repr(self.__opsymbol)
+    if self.__opsymbol in ('!=', 'in'):
+      raise NotImplementedError('Inequality filters are not single filter '
+                                'expressions and therefore cannot be converted '
+                                'to a single filter (%r)' % self.__opsymbol)
     value = self.__value
     if isinstance(value, Binding):
       bindings[value.key] = value
@@ -401,7 +408,8 @@ class FilterNode(Node):
 
   def resolve(self):
     if self.__opsymbol == 'in':
-      assert isinstance(self.__value, Binding), 'Unexpanded non-Binding IN'
+      if isinstance(self.__value, Binding):
+        raise RuntimeError('Unexpanded non-Binding IN.')
       return FilterNode(self.__name, self.__opsymbol, self.__value.resolve())
     else:
       return self
@@ -427,7 +435,7 @@ class PostFilterNode(Node):
       return NotImplemented
     return self is other
 
-  def _to_filter(self, bindings, post=False):
+  def _to_filter(self, unused_bindings, post=False):
     if post:
       return self.predicate
     else:
@@ -441,13 +449,16 @@ class ConjunctionNode(Node):
   """Tree node representing a Boolean AND operator on two or more nodes."""
 
   def __new__(cls, *nodes):
-    assert nodes, 'ConjunctionNode requires at least one node'
-    if len(nodes) == 1:
+    if not nodes:
+      raise TypeError('ConjunctionNode() requires at least one node.')
+    elif len(nodes) == 1:
       return nodes[0]
     clauses = [[]]  # Outer: Disjunction; inner: Conjunction.
     # TODO: Remove duplicates?
     for node in nodes:
-      assert isinstance(node, Node), repr(node)
+      if not isinstance(node, Node):
+        raise TypeError('ConjunctionNode() expects Node instances as arguments;'
+                        ' received a non-Node instance %r' % node)
       if isinstance(node, DisjunctionNode):
         # Apply the distributive law: (X or Y) and (A or B) becomes
         # (X and A) or (X and B) or (Y and A) or (Y and B).
@@ -478,7 +489,7 @@ class ConjunctionNode(Node):
     return iter(self.__nodes)
 
   def __repr__(self):
-    return 'OR(%s)' % (', '.join(map(str, self.__nodes)))
+    return 'AND(%s)' % (', '.join(map(str, self.__nodes)))
 
   def __eq__(self, other):
     if not isinstance(other, ConjunctionNode):
@@ -520,14 +531,17 @@ class DisjunctionNode(Node):
   """Tree node representing a Boolean OR operator on two or more nodes."""
 
   def __new__(cls, *nodes):
-    assert nodes, 'DisjunctionNode requires at least one node'
-    if len(nodes) == 1:
+    if not nodes:
+      raise TypeError('DisjunctionNode() requires at least one node')
+    elif len(nodes) == 1:
       return nodes[0]
     self = super(DisjunctionNode, cls).__new__(cls)
     self.__nodes = []
     # TODO: Remove duplicates?
     for node in nodes:
-      assert isinstance(node, Node), repr(node)
+      if not isinstance(node, Node):
+        raise TypeError('DisjunctionNode() expects Node instances as arguments;'
+                        ' received a non-Node instance %r' % node)
       if isinstance(node, DisjunctionNode):
         self.__nodes.extend(node.__nodes)
       else:
@@ -570,18 +584,19 @@ def _args_to_val(func, args, bindings):
     elif isinstance(arg, gql.Literal):
       val = arg.Get()
     else:
-      assert False, 'Unexpected arg (%r)' % arg
+      raise TypeError('Unexpected arg (%r)' % arg)
     vals.append(val)
   if func == 'nop':
-    assert len(vals) == 1, '"nop" requires exactly one value'
+    if len(vals) != 1:
+      raise TypeError('"nop" requires exactly one value')
     return vals[0]
   if func == 'list':
     return vals
   if func == 'key':
     if len(vals) == 1 and isinstance(vals[0], basestring):
       return model.Key(urlsafe=vals[0])
-    assert False, 'Unexpected key args (%r)' % (vals,)
-  assert False, 'Unexpected func (%r)' % func
+    raise TypeError('Unexpected key args (%r)' % vals)
+  raise ValueError('Unexpected func (%r)' % func)
 
 
 # TODO: Not everybody likes GQL.
@@ -607,11 +622,13 @@ def parse_gql(query_string):
   for ((name, op), values) in flt.iteritems():
     op = op.lower()
     if op == 'is' and name == gql.GQL._GQL__ANCESTOR:
-      assert len(values) == 1, '"is" requires exactly one value'
+      if len(values) != 1:
+        raise ValueError('"is" requires exactly one value')
       [(func, args)] = values
       ancestor = _args_to_val(func, args, bindings)
       continue
-    assert op in _OPS, repr(op)
+    if op not in _OPS:
+      raise NotImplementedError('Operation %r is not supported.' % op)
     for (func, args) in values:
       val = _args_to_val(func, args, bindings)
       filters.append(FilterNode(name, op, val))
@@ -621,7 +638,7 @@ def parse_gql(query_string):
   else:
     filters = None
   orders = _orderings_to_orders(gql_qry.orderings())
-  qry = Query(kind=gql_qry._entity,
+  qry = Query(kind=gql_qry._kind,
               ancestor=ancestor,
               filters=filters,
               orders=orders)
@@ -648,7 +665,8 @@ class Query(object):
   """
 
   @datastore_rpc._positional(1)
-  def __init__(self, kind=None, ancestor=None, filters=None, orders=None):
+  def __init__(self, kind=None, ancestor=None, filters=None, orders=None,
+               app=None, namespace=None):
     """Constructor.
 
     Args:
@@ -656,18 +674,32 @@ class Query(object):
       ancestor: Optional ancestor Key.
       filters: Optional Node representing a filter expression tree.
       orders: Optional datastore_query.Order object.
+      app: Optional app id.
+      namespace: Optional namespace.
     """
     if ancestor is not None and not isinstance(ancestor, Binding):
-      lastid = ancestor.pairs()[-1][1]
-      assert lastid, 'ancestor cannot be an incomplete key'
+      if not ancestor.id():
+        raise TypeError('ancestor cannot be an incomplete key')
+      if app is not None:
+        if app != ancestor.app():
+          raise TypeError('app/ancestor mismatch')
+      if namespace is not None:
+        if namespace != ancestor.namespace():
+          raise TypeError('namespace/ancestor mismatch')
     if filters is not None:
-      assert isinstance(filters, Node), repr(filters)
+      if not isinstance(filters, Node):
+        raise TypeError('filters must be a query Node or None; received %r' %
+                        filters)
     if orders is not None:
-      assert isinstance(orders, datastore_query.Order), repr(orders)
+      if not isinstance(orders, datastore_query.Order):
+        raise TypeError('orders must be an Order instance or None; received %r'
+                        % orders)
     self.__kind = kind  # String
     self.__ancestor = ancestor  # Key
     self.__filters = filters  # None or Node subclass
     self.__orders = orders  # None or datastore_query.Order instance
+    self.__app = app
+    self.__namespace = namespace
 
   def __repr__(self):
     args = []
@@ -679,6 +711,10 @@ class Query(object):
       args.append('filters=%r' % self.__filters)
     if self.__orders is not None:
       args.append('orders=...')  # PropertyOrder doesn't have a good repr().
+    if self.__app is not None:
+      args.append('app=%r' % self.__app)
+    if self.__namespace is not None:
+      args.append('namespace=%r' % self.__namespace)
     return '%s(%s)' % (self.__class__.__name__, ', '.join(args))
 
   def _get_query(self, connection):
@@ -695,7 +731,9 @@ class Query(object):
     if filters is not None:
       post_filters = filters._post_filters()
       filters = filters._to_filter(bindings)
-    dsquery = datastore_query.Query(kind=kind.decode('utf-8'),
+    dsquery = datastore_query.Query(app=self.__app,
+                                    namespace=self.__namespace,
+                                    kind=kind.decode('utf-8'),
                                     ancestor=ancestor,
                                     filter_predicate=filters,
                                     order=self.__orders)
@@ -716,10 +754,7 @@ class Query(object):
 
       if dsquery is None:
         dsquery = self._get_query(conn)
-      orig_options = options
       rpc = dsquery.run_async(conn, options)
-      skipped = 0
-      count = 0
       while rpc is not None:
         batch = yield rpc
         rpc = batch.next_batch_async(options)
@@ -729,7 +764,7 @@ class Query(object):
 
     except Exception:
       if not queue.done():
-        t, e, tb = sys.exc_info()
+        _, e, tb = sys.exc_info()
         queue.set_exception(e, tb)
       raise
 
@@ -751,6 +786,11 @@ class Query(object):
   def kind(self):
     """Accessor for the kind (a string or None)."""
     return self.__kind
+
+  @property
+  def namespace(self):
+    """Accessor for the namespace (a string or None)."""
+    return self.__namespace
 
   @property
   def ancestor(self):
@@ -776,7 +816,8 @@ class Query(object):
     if f:
       preds.append(f)
     for arg in args:
-      assert isinstance(arg, Node), repr(arg)
+      if not isinstance(arg, Node):
+        raise TypeError('Cannot filter a non-Node argument; received %r' % arg)
       preds.append(arg)
     if not preds:
       pred = None
@@ -785,7 +826,8 @@ class Query(object):
     else:
       pred = ConjunctionNode(*preds)
     return self.__class__(kind=self.kind, ancestor=self.ancestor,
-                          orders=self.orders, filters=pred)
+                          orders=self.orders, filters=pred,
+                          namespace=self.namespace)
 
   def order(self, *args):
     """Return a new Query with additional sort order(s) applied."""
@@ -802,7 +844,8 @@ class Query(object):
       elif isinstance(arg, datastore_query.Order):
         orders.append(arg)
       else:
-        assert False, arg
+        raise TypeError('order() expects a Property or query Order; '
+                        'received %r' % arg)
     if not orders:
       orders = None
     elif len(orders) == 1:
@@ -810,7 +853,8 @@ class Query(object):
     else:
       orders = datastore_query.CompositeOrder(orders)
     return self.__class__(kind=self.kind, ancestor=self.ancestor,
-                          filters=self.filters, orders=orders)
+                          filters=self.filters, orders=orders,
+                          namespace=self.namespace)
 
   # Datastore API using the default context.
 
@@ -891,8 +935,10 @@ class Query(object):
 
     This is the asynchronous version of Query.fetch().
     """
-    assert 'limit' not in q_options, q_options
-    if limit is None:
+    if 'limit' in q_options:
+      raise TypeError('Cannot specify limit as a non-keyword argument and as a '
+                      'keyword argument simultaneously.')
+    elif limit is None:
       limit = _MAX_LIMIT
     q_options['limit'] = limit
     q_options.setdefault('prefetch_size', limit)
@@ -956,9 +1002,13 @@ class Query(object):
     This is the asynchronous version of Query.count().
     """
     # TODO: Support offset by incorporating it to the limit.
-    assert 'offset' not in q_options, q_options
-    assert 'limit' not in q_options, q_options
-    if limit is None:
+    if 'offset' in q_options:
+      raise NotImplementedError('.count() and .count_async() do not support '
+                                'offsets at present.')
+    if 'limit' in q_options:
+      raise TypeError('Cannot specify limit as a non-keyword argument and as a '
+                      'keyword argument simultaneously.')
+    elif limit is None:
       limit = _MAX_LIMIT
     if (self.__filters is not None and
         isinstance(self.__filters, DisjunctionNode)):
@@ -1023,7 +1073,7 @@ class Query(object):
     """
     q_options.setdefault('batch_size', page_size)
     q_options.setdefault('produce_cursors', True)
-    it = self.iter(limit=page_size+1, **q_options)
+    it = self.iter(limit=page_size + 1, **q_options)
     results = []
     while (yield it.has_next_async()):
       results.append(it.next())
@@ -1053,7 +1103,9 @@ def _make_options(q_options):
     return None
   if 'options' in q_options:
     # Move 'options' to 'config' since that is what QueryOptions() uses.
-    assert 'config' not in q_options, q_options
+    if 'config' in q_options:
+      raise TypeError('The options pertaining to a config option must be '
+                      'given independently instead of using a config argument.')
     q_options['config'] = q_options.pop('options')
   return QueryOptions(**q_options)
 
@@ -1120,7 +1172,8 @@ class QueryIterator(object):
     self._fut = None
 
   def _extended_callback(self, batch, index, ent):
-    assert not self._exhausted, 'QueryIterator is already exhausted'
+    if self._exhausted:
+      raise RuntimeError('QueryIterator is already exhausted')
     # TODO: Make _lookup a deque.
     if self._lookahead is None:
       self._lookahead = []
@@ -1234,8 +1287,14 @@ class _SubQueryIteratorState(object):
     self.orders = orders
 
   def __cmp__(self, other):
-    assert isinstance(other, _SubQueryIteratorState), repr(other)
-    assert self.orders == other.orders, (self.orders, other.orders)
+    if not isinstance(other, _SubQueryIteratorState):
+      raise NotImplementedError('Can only compare _SubQueryIteratorState '
+                                'instances to other _SubQueryIteratorState '
+                                'instances; not %r' % other)
+    if not self.orders == other.orders:
+      raise NotImplementedError('Cannot compare _SubQueryIteratorStates with '
+                                'differing orders (%r != %r)' %
+                                (self.orders, other.orders))
     lhs = self.entity._orig_pb
     rhs = other.entity._orig_pb
     lhs_filter = self.dsquery._filter_predicate
@@ -1271,14 +1330,25 @@ class _MultiQuery(object):
   # The HR datastore makes that a useful special case.
 
   def __init__(self, subqueries):
-    assert isinstance(subqueries, list), subqueries
-    assert all(isinstance(subq, Query) for subq in subqueries), subqueries
-    kind = subqueries[0].kind
-    assert kind, 'Subquery kind cannot be missing'
-    assert all(subq.kind == kind for subq in subqueries), subqueries
-    # TODO: Assert app and namespace match, when we support them.
-    orders = subqueries[0].orders
-    assert all(subq.orders == orders for subq in subqueries), subqueries
+    if not isinstance(subqueries, list):
+      raise TypeError('subqueries must be a list; received %r' % subqueries)
+    for subq in subqueries:
+      if not isinstance(subq, Query):
+        raise TypeError('Each subquery must be a Query instances; received  %r'
+                        % subq)
+    first_subquery = subqueries[0]
+    kind = first_subquery.kind
+    orders = first_subquery.orders
+    if not kind:
+      raise ValueError('Subquery kind cannot be missing')
+    for subq in subqueries[1:]:
+      if subq.kind != kind:
+        raise ValueError('Subqueries must be for a common kind (%s != %s)' %
+                         (subq.kind, kind))
+      elif subq.orders != orders:
+        raise ValueError('Subqueries must have the same order(s) (%s != %s)' %
+                         (subq.orders, orders))
+    # TODO: Ensure that app and namespace match, when we support them.
     self.__subqueries = subqueries
     self.__orders = orders
     self.ancestor = None  # Hack for map_query().
@@ -1443,7 +1513,7 @@ class _MultiQuery(object):
 
 def _order_to_ordering(order):
   pb = order._to_pb()
-  return (pb.property(), pb.direction())  # TODO: What about UTF-8?
+  return pb.property(), pb.direction()  # TODO: What about UTF-8?
 
 
 def _orders_to_orderings(orders):
@@ -1454,7 +1524,7 @@ def _orders_to_orderings(orders):
   if isinstance(orders, datastore_query.CompositeOrder):
     # TODO: What about UTF-8?
     return [(pb.property(), pb.direction()) for pb in orders._to_pbs()]
-  assert False, 'Bad order: %r' % (orders,)
+  raise ValueError('Bad order: %r' % (orders,))
 
 
 def _ordering_to_order(ordering):

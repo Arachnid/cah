@@ -22,7 +22,7 @@ The return value from put() is a Key (see the documentation for
 ndb/key.py), which can be used to retrieve the same entity later:
 
   p2 = k.get()
-  assert p2 == p
+  p2 == p  # Returns True
 
 To update an entity, simple change its attributes and write it back
 (note that this doesn't change the key):
@@ -257,16 +257,19 @@ And finally these (without async variants):
 
 - in_transaction() tests whether you are currently running in a transaction
 - @transactional decorates functions that should be run in a transaction
+
+There are many other interesting features.  For example, Model
+subclasses may define pre-call and post-call hooks for most operations
+(get, put, delete, allocate_ids), and Property classes may be
+subclassed to suit various needs.
 """
 
 __author__ = 'guido@google.com (Guido van Rossum)'
 
-# TODO: Change asserts to better exceptions.
 # TODO: Add PolyModel.
 
 import copy
 import datetime
-import logging
 import zlib
 
 from google.appengine.api import datastore_errors
@@ -281,9 +284,11 @@ from . import utils
 # NOTE: 'key' is a common local variable name.
 from . import key as key_module
 Key = key_module.Key  # For export.
+_MAX_LONG = key_module._MAX_LONG
 
 # NOTE: Property and Error classes are added later.
-__all__ = ['Key', 'ModelAdapter', 'ModelKey', 'MetaModel', 'Model', 'Expando',
+__all__ = ['Key', 'ModelAdapter', 'ModelAttribute',
+           'ModelKey', 'MetaModel', 'Model', 'Expando',
            'BlobKey', 'GeoPt', 'Rollback',
            'transaction', 'transaction_async',
            'in_transaction', 'transactional',
@@ -331,11 +336,12 @@ class ModelAdapter(datastore_rpc.AbstractAdapter):
     self.want_pbs = 0
 
   # Make this a context manager to request setting _orig_pb.
+  # Used in query.py by _MultiQuery.run_to_queue().
 
   def __enter__(self):
     self.want_pbs += 1
 
-  def __exit__(self, *args):
+  def __exit__(self, *unused_args):
     self.want_pbs -= 1
 
   def pb_to_key(self, pb):
@@ -345,17 +351,15 @@ class ModelAdapter(datastore_rpc.AbstractAdapter):
     return key.reference()
 
   def pb_to_entity(self, pb):
+    key = None
     kind = None
     if pb.has_key():
-      # TODO: Fix the inefficiency here: we extract the key just so we
-      # can get the kind just so we can find the intended model class,
-      # but the key is extracted again and stored in the entity by _from_pb().
       key = Key(reference=pb.key())
       kind = key.kind()
     modelclass = Model._kind_map.get(kind, self.default_model)
     if modelclass is None:
       raise KindError("No implementation found for kind '%s'" % kind)
-    entity = modelclass._from_pb(pb)
+    entity = modelclass._from_pb(pb, key=key, set_key=False)
     if self.want_pbs:
       entity._orig_pb = pb
     return entity
@@ -375,7 +379,14 @@ def make_connection(config=None, default_model=None):
       config=config)
 
 
-class Property(object):
+class ModelAttribute(object):
+  """A Base class signifying the presence of a _fix_up() method."""
+
+  def _fix_up(self, cls, code_name):
+    pass
+
+
+class Property(ModelAttribute):
   """A class describing a typed, persisted attribute of a datastore entity.
 
   Not to be confused with Python's 'property' built-in.
@@ -413,7 +424,8 @@ class Property(object):
     if name is not None:
       if isinstance(name, unicode):
         name = name.encode('utf-8')
-      assert '.' not in name  # The '.' is used elsewhere.
+      if '.' in name:
+        raise ValueError('name cannot contain period characters' % name)
       self._name = name
     if indexed is not None:
       self._indexed = indexed
@@ -423,12 +435,15 @@ class Property(object):
       self._required = required
     if default is not None:
       self._default = default
-    assert (bool(self._repeated) +
-            bool(self._required) +
-            (self._default is not None)) <= 1  # Allow at most one of these
+    if (bool(self._repeated) +
+        bool(self._required) +
+        (self._default is not None)) > 1:
+      raise ValueError('repeated, required and default are mutally exclusive.')
     if choices is not None:
-      assert isinstance(choices, (tuple, list))
-      self._choices = tuple(choices)
+      if not isinstance(choices, (list, tuple, set, frozenset)):
+        raise TypeError('choices must be a list, tuple or set; received %r' %
+                        choices)
+      self._choices = frozenset(choices)
     if validator is not None:
       # The validator is called as follows:
       #   value = validator(prop, value)
@@ -437,11 +452,13 @@ class Property(object):
       # not further modify the value.  So a validator that returns e.g.
       # value.lower() or value.strip() is fine, but one that returns
       # value + '$' is not.
-      assert callable(validator)
+      if not hasattr(validator, '__call__'):
+        raise TypeError('validator must be callable or None; received %r'
+                        % validator)
       self._validator = validator
 
   def __repr__(self):
-    """Return a compact unambiguous string representation."""
+    """Return a compact unambiguous string representation of a property."""
     args = []
     cls = self.__class__
     for i, attr in enumerate(self._attributes):
@@ -476,11 +493,15 @@ class Property(object):
     Returns:
       A FilterNode instance representing the requested comparison.
     """
+    if not self._indexed:
+      raise datastore_errors.BadFilterError(
+        'Cannot query for unindexed property %s' % self._name)
     from .query import FilterNode  # Import late to avoid circular imports.
     if value is not None:
       # TODO: Allow query.Binding instances?
-      value = self._validate(value)
-    return FilterNode(self._name, op, self._datastore_type(value))
+      value = self._do_validate(value)
+      value = self._datastore_type(value)
+    return FilterNode(self._name, op, value)
 
   # Comparison operators on Property instances don't compare the
   # properties; instead they return FilterNode instances that can be
@@ -523,15 +544,19 @@ class Property(object):
     as .IN(); ._IN() is provided for the case you have a
     StructuredProperty with a model that has a Property named IN.
     """
+    if not self._indexed:
+      raise datastore_errors.BadFilterError(
+        'Cannot query for unindexed property %s' % self._name)
     from .query import FilterNode  # Import late to avoid circular imports.
-    if not isinstance(value, (list, tuple)):
-      raise datastore_errors.BadArgumentError('Expected list or tuple, got %r' %
-                                              (value,))
+    if not isinstance(value, (list, tuple, set, frozenset)):
+      raise datastore_errors.BadArgumentError(
+        'Expected list, tuple or set, got %r' % (value,))
     values = []
     for val in value:
       if val is not None:
-        val is self._validate(val)
-        values.append(val)
+        val = self._do_validate(val)
+        val = self._datastore_type(val)
+      values.append(val)
     return FilterNode(self._name, 'in', values)
   IN = _IN
 
@@ -594,7 +619,7 @@ class Property(object):
           (value, self._name))
     return value
 
-  def _fix_up(self, code_name):
+  def _fix_up(self, cls, code_name):
     """Internal helper called to tell the property its name.
 
     This is called by _fix_up_properties() which is called by
@@ -629,16 +654,13 @@ class Property(object):
       if not isinstance(value, (list, tuple)):
         raise datastore_errors.BadValueError('Expected list or tuple, got %r' %
                                              (value,))
-      values = []
-      for val in value:
-        val = self._do_validate(val)
-        values.append(val)
+      value = [self._do_validate(v) for v in value]
     else:
       if value is not None:
         value = self._do_validate(value)
     self._store_value(entity, value)
 
-  def _has_value(self, entity):
+  def _has_value(self, entity, unused_rest=None):
     """Internal helper to ask if the entity has a value for this Property."""
     return self._name in entity._values
 
@@ -680,7 +702,7 @@ class Property(object):
     return not self._required or (self._has_value(entity) and
                                   self._get_value(entity) is not None)
 
-  def __get__(self, entity, cls=None):
+  def __get__(self, entity, unused_cls=None):
     """Descriptor protocol: get the value from the entity."""
     if entity is None:
       return self  # __get__ called on class
@@ -712,7 +734,9 @@ class Property(object):
       value = [value]
     elif value is None:
       value = []
-    assert isinstance(value, list)
+    elif not isinstance(value, list):
+      raise TypeError('value of %s must be a list; found %r' %
+                      (self._name, value))
     for val in value:
       if self._repeated:
         # Re-validate repeated values, since the user could have
@@ -728,7 +752,7 @@ class Property(object):
       if val is not None:
         self._db_set_value(v, p, val)
 
-  def _deserialize(self, entity, p, depth=1):
+  def _deserialize(self, entity, p, unused_depth=1):
     """Internal helper to deserialize this property from a protocol buffer.
 
     Subclasses may override this method.
@@ -750,21 +774,11 @@ class Property(object):
       else:
         value = [val]
     else:
-      if not self._has_value(entity):
-        value = val
-      else:
-        oldval = self._retrieve_value(entity)
-        # Maybe upgrade to a list property.  Or ignore null.
-        if val is None:
-          value = oldval
-        elif oldval is None:
-          value = val
-        elif isinstance(oldval, list):
-          oldval.append(val)
-          value = oldval
-        else:
-          value = [oldval, val]
+      value = val
     self._store_value(entity, value)
+
+  def _prepare_for_put(self, entity):
+    pass
 
 
 def _validate_key(value, entity=None):
@@ -782,6 +796,7 @@ class ModelKey(Property):
   """Special property to store the Model key."""
 
   def __init__(self):
+    super(ModelKey, self).__init__()
     self._name = '__key__'
 
   def _datastore_type(self, value):
@@ -802,15 +817,16 @@ class ModelKey(Property):
     """Setter for key attribute."""
     if value is not None:
       value = _validate_key(value, entity=entity)
-    entity._key = value
+      value = entity._validate_key(value)
+    entity._entity_key = value
 
   def _get_value(self, entity):
     """Getter for key attribute."""
-    return entity._key
+    return entity._entity_key
 
   def _delete_value(self, entity):
     """Deleter for key attribute."""
-    entity._key = None
+    entity._entity_key = None
 
 
 class BooleanProperty(Property):
@@ -823,11 +839,13 @@ class BooleanProperty(Property):
                                            (value,))
     return value
 
-  def _db_set_value(self, v, p, value):
-    assert isinstance(value, bool), (self._name)
+  def _db_set_value(self, v, unused_p, value):
+    if not isinstance(value, bool):
+      raise TypeError('BooleanProperty %s can only be set to bool values; '
+                      'received %r' % (self._name, value))
     v.set_booleanvalue(value)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_booleanvalue():
       return None
     # The booleanvalue field is an int32, so booleanvalue() returns an
@@ -844,11 +862,13 @@ class IntegerProperty(Property):
                                            (value,))
     return int(value)
 
-  def _db_set_value(self, v, p, value):
-    assert isinstance(value, (bool, int, long)), (self._name)
+  def _db_set_value(self, v, unused_p, value):
+    if not isinstance(value, (bool, int, long)):
+      raise TypeError('IntegerProperty %s can only be set to integer values; '
+                      'received %r' % (self._name, value))
     v.set_int64value(value)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_int64value():
       return None
     return int(v.int64value())
@@ -866,11 +886,13 @@ class FloatProperty(Property):
                                            (value,))
     return float(value)
 
-  def _db_set_value(self, v, p, value):
-    assert isinstance(value, (bool, int, long, float)), (self._name)
+  def _db_set_value(self, v, unused_p, value):
+    if not isinstance(value, (bool, int, long, float)):
+      raise TypeError('FloatProperty %s can only be set to integer or float '
+                      'values; received %r' % (self._name, value))
     v.set_doublevalue(float(value))
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_doublevalue():
       return None
     return v.doublevalue()
@@ -888,14 +910,16 @@ class StringProperty(Property):
     return value
 
   def _db_set_value(self, v, p, value):
-    assert isinstance(value, basestring)
+    if not isinstance(value, basestring):
+      raise TypeError('StringProperty %s can only be set to string values; '
+                      'received %r' % (self._name, value))
     if isinstance(value, unicode):
       value = value.encode('utf-8')
     v.set_stringvalue(value)
     if not self._indexed:
       p.set_meaning(entity_pb.Property.TEXT)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_stringvalue():
       return None
     raw = v.stringvalue()
@@ -953,7 +977,9 @@ class CompressedPropertyMixin(object):
         value = zlib.compress(self._serialize_value(value))
     else:
       value = self._serialize_value(value)
-    assert isinstance(value, str)
+    if not isinstance(value, str):
+      raise RuntimeError('Compressed value of %s is not a string %r' %
+                         (self._name, value))
     v.set_stringvalue(value)
 
   def _db_get_value(self, v, p):
@@ -1007,7 +1033,9 @@ class TextProperty(CompressedPropertyMixin, StringProperty):
   @datastore_rpc._positional(1 + _positional)
   def __init__(self, compressed=False, **kwds):
     super(TextProperty, self).__init__(**kwds)
-    assert not self._indexed
+    if self._indexed:
+      raise NotImplementedError('TextProperty %s cannot be indexed.' %
+                                self._name)
     self._compressed = compressed
 
   def _validate(self, value):
@@ -1025,7 +1053,9 @@ class TextProperty(CompressedPropertyMixin, StringProperty):
     self._db_set_compressed_value(v, p, value)
 
   def _serialize_value(self, value):
-    assert isinstance(value, basestring)
+    if not isinstance(value, basestring):
+      raise TypeError('TextProperty %s can only be serialized to string values;'
+                      ' received %r' % (self._name, value))
     if isinstance(value, unicode):
       return value.encode('utf-8')
     return value
@@ -1051,7 +1081,9 @@ class BlobProperty(CompressedPropertyMixin, Property):
   def __init__(self, name=None, compressed=False, **kwds):
     super(BlobProperty, self).__init__(name=name, **kwds)
     self._compressed = compressed
-    assert not (compressed and self._indexed)
+    if compressed and self._indexed:
+      raise NotImplementedError('BlobProperty %s cannot be compressed and '
+                                'indexed at the same time.' % self._name)
 
   def _validate(self, value):
     if self._compressed and isinstance(value, _CompressedValue):
@@ -1064,7 +1096,9 @@ class BlobProperty(CompressedPropertyMixin, Property):
   def _datastore_type(self, value):
     # Since this is only used for queries, and queries imply an
     # indexed property, check that, and always use ByteString.
-    assert self._indexed
+    if not self._indexed:
+      raise RuntimeError('datastore_type should not be queried on non-indexed '
+                         'BlobProperty %s' % self._name)
     return datastore_types.ByteString(value)
 
 
@@ -1077,13 +1111,15 @@ class GeoPtProperty(Property):
                                            (value,))
     return value
 
-  def _db_set_value(self, v, p, value):
-    assert isinstance(value, GeoPt), (self._name)
+  def _db_set_value(self, v, unused_p, value):
+    if not isinstance(value, GeoPt):
+      raise TypeError('GeoPtProperty %s can only be set to GeoPt values; '
+                      'received %r' % (self._name, value))
     pv = v.mutable_pointvalue()
     pv.set_x(value.lat)
     pv.set_y(value.lon)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_pointvalue():
       return None
     pv = v.pointvalue()
@@ -1128,7 +1164,9 @@ class UserProperty(Property):
   def _db_set_value(self, v, p, value):
     datastore_types.PackUser(p.name(), value, v)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
+    if not v.has_uservalue():
+      return None
     return _unpack_user(v)
 
 
@@ -1148,10 +1186,12 @@ class KeyProperty(Property):
                                            (value,))
     return value
 
-  def _db_set_value(self, v, p, value):
-    assert isinstance(value, Key)
+  def _db_set_value(self, v, unused_p, value):
+    if not isinstance(value, Key):
+      raise TypeError('KeyProperty %s can only be set to Key values; '
+                      'received %r' % (self._name, value))
     # See datastore_types.PackKey
-    ref = value._reference()  # Don't copy
+    ref = value.reference()
     rv = v.mutable_referencevalue()  # A Reference
     rv.set_app(ref.app())
     if ref.has_name_space():
@@ -1159,7 +1199,7 @@ class KeyProperty(Property):
     for elem in ref.path().element_list():
       rv.add_pathelement().CopyFrom(elem)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_referencevalue():
       return None
     ref = entity_pb.Reference()
@@ -1184,11 +1224,13 @@ class BlobKeyProperty(Property):
     return value
 
   def _db_set_value(self, v, p, value):
-    assert isinstance(value, datastore_types.BlobKey)
+    if not isinstance(value, datastore_types.BlobKey):
+      raise TypeError('BlobKeyProperty %s can only be set to BlobKey values; '
+                      'received %r' % (self._name, value))
     p.set_meaning(entity_pb.Property.BLOBKEY)
     v.set_stringvalue(str(value))
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_stringvalue():
       return None
     return datastore_types.BlobKey(v.stringvalue())
@@ -1219,8 +1261,12 @@ class DateTimeProperty(Property):
   def __init__(self, name=None, auto_now=False, auto_now_add=False, **kwds):
     super(DateTimeProperty, self).__init__(name=name, **kwds)
     if self._repeated:
-      assert not auto_now
-      assert not auto_now_add
+      if auto_now:
+        raise ValueError('DateTimeProperty %s could use auto_now and be '
+                         'repeated, but there would be no point.' % self._name)
+      elif auto_now_add:
+        raise ValueError('DateTimeProperty %s could use auto_now_add and be '
+                         'repeated, but there would be no point.' % self._name)
     self._auto_now = auto_now
     self._auto_now_add = auto_now_add
 
@@ -1233,22 +1279,26 @@ class DateTimeProperty(Property):
   def _now(self):
     return datetime.datetime.now()
 
-  def _serialize(self, entity, *rest):
+  def _prepare_for_put(self, entity):
     if (self._auto_now or
         (self._auto_now_add and self._retrieve_value(entity) is None)):
       value = self._now()
       self._store_value(entity, value)
-    super(DateTimeProperty, self)._serialize(entity, *rest)
 
   def _db_set_value(self, v, p, value):
-    assert isinstance(value, datetime.datetime)
-    assert value.tzinfo is None
+    if not isinstance(value, datetime.datetime):
+      raise TypeError('DatetimeProperty %s can only be set to datetime values; '
+                      'received %r' % (self._name, value))
+    if value.tzinfo is not None:
+      raise NotImplementedError('DatetimeProperty %s can only support UTC. '
+                                'Please derive a new Property to support '
+                                'alternative timezones.' % self._name)
     dt = value - _EPOCH
-    ival = dt.microseconds + 1000000 * (dt.seconds + 24*3600 * dt.days)
+    ival = dt.microseconds + 1000000 * (dt.seconds + 24 * 3600 * dt.days)
     v.set_int64value(ival)
     p.set_meaning(entity_pb.Property.GD_WHEN)
 
-  def _db_get_value(self, v, p):
+  def _db_get_value(self, v, unused_p):
     if not v.has_int64value():
       return None
     ival = v.int64value()
@@ -1264,7 +1314,9 @@ def _date_to_datetime(value):
   Returns:
     A datetime object with time set to 0:00.
   """
-  assert isinstance(value, datetime.date)
+  if not isinstance(value, datetime.date):
+    raise TypeError('Cannot convert to datetime expected date value; '
+                    'received %s' % value)
   return datetime.datetime(value.year, value.month, value.day)
 
 
@@ -1277,7 +1329,9 @@ def _time_to_datetime(value):
   Returns:
     A datetime object with date set to 1970-01-01.
   """
-  assert isinstance(value, datetime.time)
+  if not isinstance(value, datetime.time):
+    raise TypeError('Cannot convert to datetime expected time value; '
+                    'received %s' % value)
   return datetime.datetime(1970, 1, 1,
                            value.hour, value.minute, value.second,
                            value.microsecond)
@@ -1305,7 +1359,9 @@ class DateProperty(DateTimeProperty):
 
   def _db_get_value(self, v, p):
     value = super(DateProperty, self)._db_get_value(v, p)
-    return value.date()
+    if value is not None:
+      value = value.date()
+    return value
 
 
 class TimeProperty(DateTimeProperty):
@@ -1329,7 +1385,9 @@ class TimeProperty(DateTimeProperty):
 
   def _db_get_value(self, v, p):
     value = super(TimeProperty, self)._db_get_value(v, p)
-    return value.time()
+    if value is not None:
+      value = value.time()
+    return value
 
 
 class StructuredProperty(Property):
@@ -1349,15 +1407,17 @@ class StructuredProperty(Property):
   def __init__(self, modelclass, name=None, **kwds):
     super(StructuredProperty, self).__init__(name=name, **kwds)
     if self._repeated:
-      assert not modelclass._has_repeated
+      if modelclass._has_repeated:
+        raise TypeError('Cannot repeat StructuredProperty %s that has repeated '
+                        'properties of its own.' % self._name)
     self._modelclass = modelclass
 
-  def _fix_up(self, code_name):
-    super(StructuredProperty, self)._fix_up(code_name)
+  def _fix_up(self, cls, code_name):
+    super(StructuredProperty, self)._fix_up(cls, code_name)
     self._fix_up_nested_properties()
 
   def _fix_up_nested_properties(self):
-    for name, prop in self._modelclass._properties.iteritems():
+    for prop in self._modelclass._properties.itervalues():
       prop_copy = copy.copy(prop)
       prop_copy._name = self._name + '.' + prop._name
       if isinstance(prop_copy, StructuredProperty):
@@ -1370,23 +1430,25 @@ class StructuredProperty(Property):
 
   def _comparison(self, op, value):
     if op != '=':
-      # TODO: 'in' might actually work.  But maybe it's been expanded
-      # already before we get here?
       raise datastore_errors.BadFilterError(
         'StructuredProperty filter can only use ==')
+    if not self._indexed:
+      raise datastore_errors.BadFilterError(
+        'Cannot query for unindexed StructuredProperty %s' % self._name)
     # Import late to avoid circular imports.
-    from .query import FilterNode, ConjunctionNode, PostFilterNode
+    from .query import ConjunctionNode, PostFilterNode
     from .query import RepeatedStructuredPropertyPredicate
-    value = self._validate(value)  # None is not allowed!
+    value = self._do_validate(value)  # None is not allowed!
     filters = []
     match_keys = []
     # TODO: Why not just iterate over value._values?
-    for name, prop in value._properties.iteritems():
+    for prop in self._modelclass._properties.itervalues():
       val = prop._retrieve_value(value)
       if val is not None:
-        name = self._name + '.' + name
-        filters.append(FilterNode(name, op, val))
-        match_keys.append(name)
+        altprop = getattr(self, prop._code_name)
+        filt = altprop._comparison(op, val)
+        filters.append(filt)
+        match_keys.append(altprop._name)
     if not filters:
       raise datastore_errors.BadFilterError(
         'StructuredProperty filter without any values')
@@ -1399,11 +1461,49 @@ class StructuredProperty(Property):
       filters.append(PostFilterNode(pred))
     return ConjunctionNode(*filters)
 
+  def _IN(self, value):
+    if not isinstance(value, (list, tuple, set, frozenset)):
+      raise datastore_errors.BadArgumentError(
+        'Expected list, tuple or set, got %r' % (value,))
+    from .query import DisjunctionNode, FalseNode
+    # Expand to a series of == filters.
+    filters = [self._comparison('=', val) for val in value]
+    if not filters:
+      # DisjunctionNode doesn't like an empty list of filters.
+      # Running the query will still fail, but this matches the
+      # behavior of IN for regular properties.
+      return FalseNode()
+    else:
+      return DisjunctionNode(*filters)
+  IN = _IN
+
   def _validate(self, value):
     if not isinstance(value, self._modelclass):
       raise datastore_errors.BadValueError('Expected %s instance, got %r' %
                                            (self._modelclass.__name__, value))
     return value
+
+  def _has_value(self, entity, rest=None):
+    # rest: optional list of attribute names to check in addition.
+    # Basically, prop._has_value(self, ent, ['x', 'y']) is similar to
+    #   (prop._has_value(ent) and
+    #    prop.x._has_value(ent.x) and
+    #    prop.x.y._has_value(ent.x.y))
+    # assuming prop.x and prop.x.y exist.
+    # NOTE: This is not particularly efficient if len(rest) > 1,
+    # but that seems a rare case, so for now I don't care.
+    ok = super(StructuredProperty, self)._has_value(entity)
+    if ok and rest:
+      subent = self._get_value(entity)
+      if subent is None:
+        raise RuntimeError('Failed to retrieve sub-entity of StructuredProperty'
+                           ' %s' % self._name)
+      subprop = subent._properties.get(rest[0])
+      if subprop is None:
+        ok = False
+      else:
+        ok = subprop._has_value(subent, rest[1:])
+    return ok
 
   def _serialize(self, entity, pb, prefix='', parent_repeated=False):
     # entity -> pb; pb is an EntityProto message
@@ -1414,14 +1514,19 @@ class StructuredProperty(Property):
       return
     cls = self._modelclass
     if self._repeated:
-      assert isinstance(value, list)
+      if not isinstance(value, list):
+        raise RuntimeError('Cannot serialize repeated StructuredProperty %s; '
+                           'value retrieved not list %s' % (self._name, value))
       values = value
     else:
-      assert isinstance(value, cls)
+      if not isinstance(value, cls):
+        raise RuntimeError('Cannot serialize StructuredProperty %s; value '
+                           'retrieved not a %s instance %r' %
+                           (self._name, cls.__name__, value))
       values = [value]
     for value in values:
       # TODO: Avoid re-sorting for repeated values.
-      for name, prop in sorted(value._properties.iteritems()):
+      for unused_name, prop in sorted(value._properties.iteritems()):
         prop._serialize(value, pb, prefix + self._name + '.',
                         self._repeated or parent_repeated)
 
@@ -1431,7 +1536,11 @@ class StructuredProperty(Property):
       if subentity is None:
         subentity = self._modelclass()
         self._store_value(entity, subentity)
-      assert isinstance(subentity, self._modelclass)
+      cls = self._modelclass
+      if not isinstance(subentity, cls):
+        raise RuntimeError('Cannot deserialize StructuredProperty %s; value '
+                           'retrieved not a %s instance %r' %
+                           (self._name, cls.__name__, subentity))
       prop = subentity._get_property_for(p, depth=depth)
       prop._deserialize(subentity, p, depth + 1)
       return
@@ -1440,10 +1549,16 @@ class StructuredProperty(Property):
     # TODO: Prove we won't get here for orphans.
     name = p.name()
     parts = name.split('.')
-    assert len(parts) > depth, (depth, name, parts)
+    if len(parts) <= depth:
+      raise RuntimeError('StructuredProperty %s expected to find properties '
+                         'separated by periods at a depth of %i; received %r' %
+                         (self._name, depth, parts))
     next = parts[depth]
+    rest = parts[depth + 1:]
     prop = self._modelclass._properties.get(next)
-    assert prop is not None  # QED
+    if prop is None:
+      raise RuntimeError('Unable to find property %s of StructuredProperty %s.'
+                         % (next, self._name))
 
     values = self._retrieve_value(entity)
     if values is None:
@@ -1454,14 +1569,24 @@ class StructuredProperty(Property):
     # Find the first subentity that doesn't have a value for this
     # property yet.
     for sub in values:
-      assert isinstance(sub, self._modelclass)
-      if not prop._has_value(sub):
+      if not isinstance(sub, self._modelclass):
+        raise TypeError('sub-entities must be instances of their Model class.')
+      if not prop._has_value(sub, rest):
         subentity = sub
         break
     else:
       subentity = self._modelclass()
       values.append(subentity)
     prop._deserialize(subentity, p, depth + 1)
+
+  def _prepare_for_put(self, entity):
+    value = self._get_value(entity)
+    if value:
+      if self._repeated:
+        for subent in value:
+          subent._prepare_for_put()
+      else:
+        value._prepare_for_put()
 
 
 class LocalStructuredProperty(BlobProperty):
@@ -1486,7 +1611,9 @@ class LocalStructuredProperty(BlobProperty):
     super(LocalStructuredProperty, self).__init__(name=name,
                                                   compressed=compressed,
                                                   **kwds)
-    assert not self._indexed
+    if self._indexed:
+      raise NotImplementedError('Cannot index LocalStructuredProperty %s.' %
+                                self._name)
     self._modelclass = modelclass
 
   def _validate(self, value):
@@ -1505,6 +1632,15 @@ class LocalStructuredProperty(BlobProperty):
     pb = entity_pb.EntityProto()
     pb.MergePartialFromString(value)
     return self._modelclass._from_pb(pb, set_key=False)
+
+  def _prepare_for_put(self, entity):
+    value = self._get_value(entity)
+    if value:
+      if self._repeated:
+        for subent in value:
+          subent._prepare_for_put()
+      else:
+        value._prepare_for_put()
 
 
 class GenericProperty(Property):
@@ -1574,13 +1710,15 @@ class GenericProperty(Property):
     elif isinstance(value, bool):  # Must test before int!
       v.set_booleanvalue(value)
     elif isinstance(value, (int, long)):
-      assert -2**63 <= value < 2**63
+      if not (-_MAX_LONG <= value < _MAX_LONG):
+        raise TypeError('Property %s can only accept 64-bit integers; '
+                        'received %s' % value)
       v.set_int64value(value)
     elif isinstance(value, float):
       v.set_doublevalue(value)
     elif isinstance(value, Key):
       # See datastore_types.PackKey
-      ref = value._reference()  # Don't copy
+      ref = value.reference()
       rv = v.mutable_referencevalue()  # A Reference
       rv.set_app(ref.app())
       if ref.has_name_space():
@@ -1588,9 +1726,12 @@ class GenericProperty(Property):
       for elem in ref.path().element_list():
         rv.add_pathelement().CopyFrom(elem)
     elif isinstance(value, datetime.datetime):
-      assert value.tzinfo is None
+      if value.tzinfo is not None:
+        raise NotImplementedError('Property %s can only support the UTC. '
+                                  'Please derive a new Property to support '
+                                  'alternative timezones.' % self._name)
       dt = value - _EPOCH
-      ival = dt.microseconds + 1000000 * (dt.seconds + 24*3600 * dt.days)
+      ival = dt.microseconds + 1000000 * (dt.seconds + 24 * 3600 * dt.days)
       v.set_int64value(ival)
       p.set_meaning(entity_pb.Property.GD_WHEN)
     elif isinstance(value, GeoPt):
@@ -1601,7 +1742,8 @@ class GenericProperty(Property):
       datastore_types.PackUser(p.name(), value, v)
     else:
       # TODO: BlobKey.
-      assert False, type(value)
+      raise NotImplementedError('Property %s does not support %s types.' %
+                                (self._name, type(value)))
 
 
 class ComputedProperty(GenericProperty):
@@ -1634,33 +1776,27 @@ class ComputedProperty(GenericProperty):
   ...   hash = ComputedProperty(_compute_hash, name='sha1')
   """
 
-  def __init__(self, func, *args, **kwargs):
+  def __init__(self, func, name=None, indexed=None, repeated=None):
     """Constructor.
 
     Args:
       func: A function that takes one argument, the model instance, and returns
             a calculated value.
     """
-    super(ComputedProperty, self).__init__(*args, **kwargs)
-    assert not self._required, 'ComputedProperty cannot be required'
-    assert not self._repeated, 'ComputedProperty cannot be repeated'
-    assert self._default is None, 'ComputedProperty cannot have a default'
+    super(ComputedProperty, self).__init__(name=name, indexed=indexed,
+                                           repeated=repeated)
     self._func = func
 
-  def _has_value(self, entity):
-    return True
-
-  def _store_value(self, entity, value):
+  def _set_value(self, entity, value):
     raise ComputedPropertyError("Cannot assign to a ComputedProperty")
 
-  def _delete_value(self, entity):
-    raise ComputedPropertyError("Cannot delete a ComputedProperty")
+  def _get_value(self, entity):
+    value = self._func(entity)
+    self._store_value(entity, value)
+    return value
 
-  def _retrieve_value(self, entity):
-    return self._func(entity)
-
-  def _deserialize(self, entity, p, depth=1):
-    pass
+  def _prepare_for_put(self, entity):
+    self._get_value(entity)
 
 
 class MetaModel(type):
@@ -1673,6 +1809,12 @@ class MetaModel(type):
   def __init__(cls, name, bases, classdict):
     super(MetaModel, cls).__init__(name, bases, classdict)
     cls._fix_up_properties()
+
+  def __repr__(cls):
+    props = []
+    for _, prop in sorted(cls._properties.iteritems()):
+      props.append('%s=%r' % (prop._code_name, prop))
+    return '%s<%s>' % (cls.__name__, ', '.join(props))
 
 
 class Model(object):
@@ -1710,11 +1852,12 @@ class Model(object):
   _kind_map = {}  # Dict mapping {kind: Model subclass}
 
   # Defaults for instance variables.
-  _key = None
+  _entity_key = None
   _values = None
 
   # Hardcoded pseudo-property for the key.
-  key = ModelKey()
+  _key = ModelKey()
+  key = _key
 
   @datastore_rpc._positional(1)
   def __init__(self, key=None, id=None, parent=None, **kwds):
@@ -1782,7 +1925,8 @@ class Model(object):
     cls = self.__class__
     for name, value in kwds.iteritems():
       prop = getattr(cls, name)  # Raises AttributeError for unknown properties.
-      assert isinstance(prop, Property)
+      if not isinstance(prop, Property):
+        raise TypeError('Cannot set non-property %s' % name)
       prop._set_value(self, value)
 
   def _find_uninitialized(self):
@@ -1812,7 +1956,7 @@ class Model(object):
     done = set()
     for prop in self._properties.itervalues():
       if prop._has_value(self):
-        args.append('%s=%r' % (prop._code_name, prop._retrieve_value(self)))
+        args.append('%s=%r' % (prop._code_name, prop._get_value(self)))
         done.add(prop._name)
     args.sort()
     if self._key is not None:
@@ -1864,7 +2008,10 @@ class Model(object):
 
   def _equivalent(self, other):
     """Compare two entities of the same class, excluding keys."""
-    assert other.__class__ is self.__class__  # TODO: What about subclasses?
+    if other.__class__ is not self.__class__:  # TODO: What about subclasses?
+      raise NotImplementedError('Cannot compare different model classes. '
+                                '%s is not %s' % (self.__class__.__name__,
+                                                  other.__class_.__name__))
     # It's all about determining inequality early.
     if len(self._properties) != len(other._properties):
       return False  # Can only happen for Expandos.
@@ -1895,38 +2042,44 @@ class Model(object):
 
     if set_key:
       # TODO: Move the key stuff into ModelAdapter.entity_to_pb()?
-      key = self._key
-      if key is None:
-        pairs = [(self._get_kind(), None)]
-        ref = key_module._ReferenceFromPairs(pairs, reference=pb.mutable_key())
-      else:
-        ref = key._reference()  # Don't copy
-        pb.mutable_key().CopyFrom(ref)
-      group = pb.mutable_entity_group()  # Must initialize this.
-      # To work around an SDK issue, only set the entity group if the
-      # full key is complete.  TODO: Remove the top test once fixed.
-      if key is not None and key.id():
-        elem = ref.path().element(0)
-        if elem.id() or elem.name():
-          group.add_element().CopyFrom(elem)
+      self._key_to_pb(pb)
 
-    for name, prop in sorted(self._properties.iteritems()):
+    for unused_name, prop in sorted(self._properties.iteritems()):
       prop._serialize(self, pb)
 
     return pb
 
+  def _key_to_pb(self, pb):
+    """Internal helper to copy the key into a protobuf."""
+    key = self._key
+    if key is None:
+      pairs = [(self._get_kind(), None)]
+      ref = key_module._ReferenceFromPairs(pairs, reference=pb.mutable_key())
+    else:
+      ref = key.reference()
+      pb.mutable_key().CopyFrom(ref)
+    group = pb.mutable_entity_group()  # Must initialize this.
+    # To work around an SDK issue, only set the entity group if the
+    # full key is complete.  TODO: Remove the top test once fixed.
+    if key is not None and key.id():
+      elem = ref.path().element(0)
+      if elem.id() or elem.name():
+        group.add_element().CopyFrom(elem)
+
   @classmethod
-  def _from_pb(cls, pb, set_key=True, ent=None):
+  def _from_pb(cls, pb, set_key=True, ent=None, key=None):
     """Internal helper to create an entity from an EntityProto protobuf."""
-    assert isinstance(pb, entity_pb.EntityProto)
+    if not isinstance(pb, entity_pb.EntityProto):
+      raise TypeError('pb must be a EntityProto; received %r' % pb)
     if ent is None:
       ent = cls()
 
-    if pb.has_key():
+    # A key passed in overrides a key in the pb.
+    if key is None and pb.has_key():
       key = Key(reference=pb.key())
-      # If set_key is not set, skip a trivial incomplete key.
-      if set_key or key.id() or key.parent():
-        ent._key = key
+    # If set_key is not set, skip a trivial incomplete key.
+    if key is not None and (set_key or key.id() or key.parent()):
+      ent._key = key
 
     indexed_properties = pb.property_list()
     unindexed_properties = pb.raw_property_list()
@@ -1941,7 +2094,10 @@ class Model(object):
     """Internal helper to get the Property for a protobuf-level property."""
     name = p.name()
     parts = name.split('.')
-    assert len(parts) > depth, (p.name(), parts, depth)
+    if len(parts) <= depth:
+      raise RuntimeError('Model %s expected to find property %s separated by '
+                         'periods at a depth of %i; received %r' %
+                         (self.__class__.__name__, name, depth, parts))
     next = parts[depth]
     prop = self._properties.get(next)
     if prop is None:
@@ -1964,6 +2120,7 @@ class Model(object):
       prop = GenericProperty(next,
                              repeated=p.multiple(),
                              indexed=indexed)
+    prop._code_name = next
     self._properties[prop._name] = prop
     return prop
 
@@ -1990,17 +2147,34 @@ class Model(object):
     if cls.__module__ == __name__:  # Skip the classes in *this* file.
       return
     for name in set(dir(cls)):
-      prop = getattr(cls, name, None)
-      if isinstance(prop, ModelKey):
-        continue
-      if isinstance(prop, Property):
-        assert not name.startswith('_')
-        # TODO: Tell prop the class, for error message.
-        prop._fix_up(name)
-        if prop._repeated:
-          cls._has_repeated = True
-        cls._properties[prop._name] = prop
+      attr = getattr(cls, name, None)
+      if isinstance(attr, ModelAttribute) and not isinstance(attr, ModelKey):
+        if name.startswith('_'):
+          raise TypeError('ModelAttribute %s cannot begin with an underscore '
+                          'character. _ prefixed attributes are reserved for '
+                          'temporary Model instance values.' % name)
+        attr._fix_up(cls, name)
+        if isinstance(attr, Property):
+          if attr._repeated:
+            cls._has_repeated = True
+          cls._properties[attr._name] = attr
     cls._kind_map[cls._get_kind()] = cls
+
+  def _prepare_for_put(self):
+    if self._properties:
+      for prop in self._properties.itervalues():
+        prop._prepare_for_put(self)
+
+  def _validate_key(self, key):
+    """Validation for _key attribute (designed to be overridden).
+
+    Args:
+      key: Proposed Key to use for entity.
+
+    Returns:
+      A valid key.
+    """
+    return key
 
   # Datastore API using the default context.
   # These use local import since otherwise they'd be recursive imports.
@@ -2041,11 +2215,20 @@ class Model(object):
     This is the asynchronous version of Model._put().
     """
     from . import tasklets
-    return tasklets.get_context().put(self, **ctx_options)
+    ctx = tasklets.get_context()
+    self._prepare_for_put()
+    if self._key is None:
+      self._key = Key(self._get_kind(), None)
+    self._pre_put_hook()
+    fut = ctx.put(self, **ctx_options)
+    post_hook = self._post_put_hook
+    if not self._is_default_hook(Model._default_post_put_hook, post_hook):
+      fut.add_immediate_callback(post_hook, fut)
+    return fut
   put_async = _put_async
 
   @classmethod
-  def _get_or_insert(cls, name, parent=None, context_options=None, **kwds):
+  def _get_or_insert(*args, **kwds):
     """Transactionally retrieves an existing entity or creates a new one.
 
     Args:
@@ -2061,22 +2244,19 @@ class Model(object):
       Existing instance of Model class with the specified key name and parent
       or a new one that has just been created.
     """
-    return cls._get_or_insert_async(name=name, parent=parent,
-                                    context_options=context_options,
-                                    **kwds).get_result()
+    cls, args = args[0], args[1:]
+    return cls._get_or_insert_async(*args, **kwds).get_result()
   get_or_insert = _get_or_insert
 
   @classmethod
-  def _get_or_insert_async(cls, name, parent=None, context_options=None,
-                           **kwds):
+  def _get_or_insert_async(*args, **kwds):
     """Transactionally retrieves an existing entity or creates a new one.
 
     This is the asynchronous version of Model._get_or_insert().
     """
     from . import tasklets
     ctx = tasklets.get_context()
-    return ctx.get_or_insert(cls, name=name, parent=parent,
-                             context_options=context_options, **kwds)
+    return ctx.get_or_insert(*args, **kwds)
   get_or_insert_async = _get_or_insert_async
 
   @classmethod
@@ -2106,9 +2286,15 @@ class Model(object):
     This is the asynchronous version of Model._allocate_ids().
     """
     from . import tasklets
+    ctx = tasklets.get_context()
+    cls._pre_allocate_ids_hook(size, max, parent)
     key = Key(cls._get_kind(), None, parent=parent)
-    return tasklets.get_context().allocate_ids(key, size=size, max=max,
-                                               **ctx_options)
+    fut = ctx.allocate_ids(key, size=size, max=max, **ctx_options)
+    post_hook = cls._post_allocate_ids_hook
+    if not cls._is_default_hook(Model._default_post_allocate_ids_hook,
+                                post_hook):
+      fut.add_immediate_callback(post_hook, size, max, parent, fut)
+    return fut
   allocate_ids_async = _allocate_ids_async
 
   @classmethod
@@ -2137,6 +2323,75 @@ class Model(object):
     return tasklets.get_context().get(key, **ctx_options)
   get_by_id_async = _get_by_id_async
 
+  # Hooks that wrap around mutations.  Most are class methods with
+  # the notable exception of put, which is an instance method.
+
+  # To use these, override them in your model class and call
+  # super(<myclass>, cls).<hook>(*args).
+
+  # Note that the pre-hooks are called before the operation is
+  # scheduled.  The post-hooks are called (by the Future) after the
+  # operation has completed.
+
+  # Do not use or touch the _default_* hooks.  These exist for
+  # internal use only.
+
+  @classmethod
+  def _pre_allocate_ids_hook(cls, size, max, parent):
+    pass
+  _default_pre_allocate_ids_hook = _pre_allocate_ids_hook
+
+  @classmethod
+  def _post_allocate_ids_hook(cls, size, max, parent, future):
+    pass
+  _default_post_allocate_ids_hook = _post_allocate_ids_hook
+
+  @classmethod
+  def _pre_delete_hook(cls, key):
+    pass
+  _default_pre_delete_hook = _pre_delete_hook
+
+  @classmethod
+  def _post_delete_hook(cls, key, future):
+    pass
+  _default_post_delete_hook = _post_delete_hook
+
+  @classmethod
+  def _pre_get_hook(cls, key):
+    pass
+  _default_pre_get_hook = _pre_get_hook
+
+  @classmethod
+  def _post_get_hook(cls, key, future):
+    pass
+  _default_post_get_hook = _post_get_hook
+
+  def _pre_put_hook(self):
+    pass
+  _default_pre_put_hook = _pre_put_hook
+
+  def _post_put_hook(self, future):
+    pass
+  _default_post_put_hook = _post_put_hook
+
+  @staticmethod
+  def _is_default_hook(default_hook, hook):
+    """Checks whether a specific hook is in its default state.
+
+    Args:
+      cls: A ndb.model.Model class.
+      default_hook: Callable specified by ndb internally (do not override).
+      hook: The hook defined by a model class using _post_*_hook.
+
+    Raises:
+      TypeError if either the default hook or the tested hook are not callable.
+    """
+    if not hasattr(default_hook, '__call__'):
+      raise TypeError('Default hooks for ndb.model.Model must be callable')
+    if not hasattr(hook, '__call__'):
+      raise TypeError('Hooks must be callable')
+    return default_hook.im_func is hook.im_func
+
 
 class Expando(Model):
   """Model subclass to support dynamic Property names and types.
@@ -2164,12 +2419,14 @@ class Expando(Model):
     if (name.startswith('_') or
         isinstance(getattr(self.__class__, name, None), (Property, property))):
       return super(Expando, self).__setattr__(name, value)
+    # TODO: Refactor this to share code with _fake_property().
     self._clone_properties()
     if isinstance(value, Model):
       prop = StructuredProperty(Model, name)
     else:
       repeated = isinstance(value, list)
       indexed = self._default_indexed
+      # TODO: What if it's a list of Model instances?
       prop = GenericProperty(name, repeated=repeated, indexed=indexed)
     prop._code_name = name
     self._properties[name] = prop
@@ -2180,23 +2437,22 @@ class Expando(Model):
         isinstance(getattr(self.__class__, name, None), (Property, property))):
       return super(Expando, self).__delattr__(name)
     prop = self._properties.get(name)
-    assert prop is not None
+    if not isinstance(prop, Property):
+      raise TypeError('Model properties must be Property instances; not %r' %
+                      prop)
     prop._delete_value(self)
-    assert prop not in self.__class__._properties
+    if prop in self.__class__._properties:
+      raise RuntimeError('Property %s still in the list of properties for the '
+                         'base class.' % name)
     del self._properties[name]
 
 
 @datastore_rpc._positional(1)
-def transaction(callback, retry=None, entity_group=None, **ctx_options):
+def transaction(callback, **ctx_options):
   """Run a callback in a transaction.
 
   Args:
     callback: A function or tasklet to be called.
-    retry: Optional retry count (keyword only; default set by
-      ndb.context.Context.transaction()).
-    entity_group: Optional root key to use as transaction entity group
-      (keyword only; defaults to the root part of the first key used
-      in the transaction).
     **ctx_options: Context options.
 
   Returns:
@@ -2212,22 +2468,17 @@ def transaction(callback, retry=None, entity_group=None, **ctx_options):
         ...
       transaction(lambda: my_callback(Key(...), 1))
   """
-  fut = transaction_async(callback, retry=retry, entity_group=entity_group,
-                          **ctx_options)
+  fut = transaction_async(callback, **ctx_options)
   return fut.get_result()
 
 
 @datastore_rpc._positional(1)
-def transaction_async(callback, retry=None, entity_group=None, **kwds):
+def transaction_async(callback, **kwds):
   """Run a callback in a transaction.
 
   This is the asynchronous version of transaction().
   """
   from . import tasklets
-  if retry is not None:
-    kwds['retry'] = retry
-  if entity_group is not None:
-    kwds['entity_group'] = entity_group
   return tasklets.get_context().transaction(callback, **kwds)
 
 
@@ -2243,9 +2494,9 @@ def transactional(func):
 
   If we're already in a transaction this is a no-op.
 
-  Note: If you need to override the retry count or the entity group,
-  or if you want some kind of async behavior, or pass Context options,
-  use the transaction() function above.
+  Note: If you need to override the retry count, or want some kind of
+  async behavior, or pass Context options, use the transaction()
+  function above.
   """
   @utils.wrapping(func)
   def transactional_wrapper(*args, **kwds):
@@ -2331,10 +2582,9 @@ def delete_multi(keys, **ctx_options):
     keys: A sequence of keys.
     **ctx_options: Context options.
 
-  Args:
-    keys: A sequence of keys.
+  Returns:
+    A list whose items are all None, one per deleted key.
   """
-  # A list full of Nones!!!
   return [future.get_result()
           for future in delete_multi_async(keys, **ctx_options)]
 

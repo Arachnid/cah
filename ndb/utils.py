@@ -4,6 +4,7 @@ import sys
 
 DEBUG = True  # Set to False for some speedups
 
+
 def wrapping(wrapped):
   # A decorator to decorate a decorator's wrapper.  Following the lead
   # of Twisted and Monocle, this is supposed to make debugging heavily
@@ -23,8 +24,8 @@ def get_stack(limit=10):
   frame = sys._getframe(1)  # Always skip get_stack() itself.
   lines = []
   while len(lines) < limit and frame is not None:
-    locals = frame.f_locals
-    ndb_debug = locals.get('__ndb_debug__')
+    f_locals = frame.f_locals
+    ndb_debug = f_locals.get('__ndb_debug__')
     if ndb_debug != 'SKIP':
       line = frame_info(frame)
       if ndb_debug is not None:
@@ -96,5 +97,5 @@ def tweak_logging():
     global DEBUG
     DEBUG = False
 
-if sys.argv[0].endswith('_test.py'):
+if 'test' in os.path.basename(sys.argv[0]):
   tweak_logging()

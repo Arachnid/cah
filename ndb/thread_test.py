@@ -3,7 +3,8 @@
 import sys
 import threading
 
-from . import tasklets, context
+from . import tasklets
+from . import context
 
 
 def main():
@@ -22,8 +23,8 @@ def main():
 
 
 @context.toplevel
-def one_thread(i, num):
-  x = yield fibonacci(num)
+def one_thread(_, num):
+  yield fibonacci(num)
   ##sys.stdout.write('%d: %d --> %d\n' % (i, num, x))
 
 
@@ -32,8 +33,8 @@ def fibonacci(n):
   """A recursive Fibonacci to exercise task switching."""
   if n <= 1:
     raise tasklets.Return(n)
-  a = yield fibonacci(n-1)
-  b = yield fibonacci(n-2)
+  a = yield fibonacci(n - 1)
+  b = yield fibonacci(n - 2)
   raise tasklets.Return(a + b)
 
 

@@ -25,12 +25,7 @@ class BaseHandler(webapp2.RequestHandler):
     self.response.write(body)
 
   def render_jsonp(self, response):
-    try:
-      cb = self.request.GET['callback']
-    except:
-      cb = ""
-    # self.response.write("%s(%s);" % (self.request.GET['callback'],
-    self.response.write("%s(%s);" % (cb,
+    self.response.write("%s(%s);" % (self.request.GET['callback'],
                                      simplejson.dumps(response)))
 
 

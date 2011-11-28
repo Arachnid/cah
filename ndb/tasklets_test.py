@@ -1,25 +1,19 @@
 """Tests for tasklets.py."""
 
 import os
-import re
 import random
+import re
 import sys
 import time
 import unittest
-
-from google.appengine.api import apiproxy_stub_map
-from google.appengine.api import datastore_file_stub
-
-from google.appengine.datastore import datastore_rpc
 
 from . import eventloop
 from . import model
 from . import test_utils
 from . import tasklets
-from .tasklets import Future, tasklet
 
 
-class TaskletTests(test_utils.DatastoreTest):
+class TaskletTests(test_utils.NDBTest):
 
   def setUp(self):
     super(TaskletTests, self).setUp()
@@ -108,7 +102,7 @@ class TaskletTests(test_utils.DatastoreTest):
       f.add_callback(self.universal_callback, f)
       def wake(fut, result):
         fut.set_result(result)
-      self.ev.queue_call(i*0.01, wake, f, i)
+      self.ev.queue_call(i * 0.01, wake, f, i)
       self.futs.append(f)
     return set(self.futs)
 
@@ -127,6 +121,8 @@ class TaskletTests(test_utils.DatastoreTest):
     self.assertEqual(self.log, [(f,) for f in self.futs])
 
   def testSleep(self):
+    # Ensure that tasklets sleep for the specified amount of time.
+    # NOTE: May sleep too long if processor usage is high.
     log = []
     @tasklets.tasklet
     def foo():
@@ -136,8 +132,9 @@ class TaskletTests(test_utils.DatastoreTest):
     foo()
     eventloop.run()
     t0, t1 = log
-    dt = t1-t0
-    self.assertAlmostEqual(dt, 0.1, places=2)
+    dt = t1 - t0
+    self.assertTrue(0.08 <= dt <= 0.12,
+                    'slept too long or too short: dt=%.03f' % dt)
 
   def testMultiFuture(self):
     @tasklets.tasklet
@@ -146,7 +143,7 @@ class TaskletTests(test_utils.DatastoreTest):
       raise tasklets.Return('foo-%s' % dt)
     @tasklets.tasklet
     def bar(n):
-      for i in range(n):
+      for _ in range(n):
         yield tasklets.sleep(0.01)
       raise tasklets.Return('bar-%d' % n)
     bar5 = bar(5)
@@ -176,9 +173,9 @@ class TaskletTests(test_utils.DatastoreTest):
 
   def testMultiFuture_SetException(self):
     mf = tasklets.MultiFuture()
-    f1 = Future()
-    f2 = Future()
-    f3 = Future()
+    f1 = tasklets.Future()
+    f2 = tasklets.Future()
+    f3 = tasklets.Future()
     f2.set_result(2)
     mf.putq(f1)
     f1.set_result(1)
@@ -193,9 +190,9 @@ class TaskletTests(test_utils.DatastoreTest):
 
   def testMultiFuture_ItemException(self):
     mf = tasklets.MultiFuture()
-    f1 = Future()
-    f2 = Future()
-    f3 = Future()
+    f1 = tasklets.Future()
+    f2 = tasklets.Future()
+    f3 = tasklets.Future()
     f2.set_result(2)
     mf.putq(f1)
     f1.set_exception(ZeroDivisionError())
@@ -211,13 +208,13 @@ class TaskletTests(test_utils.DatastoreTest):
     r1 = repr(mf)
     mf.putq(1)
     r2 = repr(mf)
-    f2 = Future()
+    f2 = tasklets.Future()
     f2.set_result(2)
     mf.putq(2)
     r3 = repr(mf)
     self.ev.run()
     r4 = repr(mf)
-    f3 = Future()
+    f3 = tasklets.Future()
     mf.putq(f3)
     r5 = repr(mf)
     mf.complete()
@@ -263,7 +260,7 @@ class TaskletTests(test_utils.DatastoreTest):
   def testQueueFuture_Complete(self):
     qf = tasklets.QueueFuture()
     qf.putq(1)
-    f2 = Future()
+    f2 = tasklets.Future()
     qf.putq(f2)
     self.ev.run()
     g1 = qf.getq()
@@ -280,18 +277,18 @@ class TaskletTests(test_utils.DatastoreTest):
 
   def testQueueFuture_SetException(self):
     qf = tasklets.QueueFuture()
-    f1 = Future()
+    f1 = tasklets.Future()
     f1.set_result(1)
     qf.putq(f1)
     qf.putq(f1)
     self.ev.run()
     qf.putq(2)
     self.ev.run()
-    f3 = Future()
+    f3 = tasklets.Future()
     f3.set_exception(ZeroDivisionError())
     qf.putq(f3)
     self.ev.run()
-    f4 = Future()
+    f4 = tasklets.Future()
     qf.putq(f4)
     self.ev.run()
     qf.set_exception(KeyError())
@@ -319,18 +316,18 @@ class TaskletTests(test_utils.DatastoreTest):
   def testQueueFuture_ItemException(self):
     qf = tasklets.QueueFuture()
     qf.putq(1)
-    f2 = Future()
+    f2 = tasklets.Future()
     qf.putq(f2)
-    f3 = Future()
+    f3 = tasklets.Future()
     f3.set_result(3)
     self.ev.run()
     qf.putq(f3)
     self.ev.run()
-    f4 = Future()
+    f4 = tasklets.Future()
     f4.set_exception(ZeroDivisionError())
     self.ev.run()
     qf.putq(f4)
-    f5 = Future()
+    f5 = tasklets.Future()
     qf.putq(f5)
     self.ev.run()
     qf.complete()
@@ -389,7 +386,7 @@ class TaskletTests(test_utils.DatastoreTest):
   def testSerialQueueFuture_ItemException(self):
     sqf = tasklets.SerialQueueFuture()
     g1 = sqf.getq()
-    f1 = Future()
+    f1 = tasklets.Future()
     sqf.putq(f1)
     sqf.complete()
     f1.set_exception(ZeroDivisionError())
@@ -397,7 +394,7 @@ class TaskletTests(test_utils.DatastoreTest):
 
   def testSerialQueueFuture_PutQ_1(self):
     sqf = tasklets.SerialQueueFuture()
-    f1 = Future()
+    f1 = tasklets.Future()
     sqf.putq(f1)
     sqf.complete()
     f1.set_result(1)
@@ -419,7 +416,7 @@ class TaskletTests(test_utils.DatastoreTest):
   def testSerialQueueFuture_PutQ_4(self):
     sqf = tasklets.SerialQueueFuture()
     g1 = sqf.getq()
-    f1 = Future()
+    f1 = tasklets.Future()
     sqf.putq(f1)
     sqf.complete()
     f1.set_result(1)
@@ -437,21 +434,21 @@ class TaskletTests(test_utils.DatastoreTest):
     for i in range(10):
       rf.putq(i)
     for i in range(10, 20):
-      f = Future()
+      f = tasklets.Future()
       rf.putq(f)
       f.set_result(i)
     rf.complete()
     self.assertEqual(rf.get_result(), sum(range(20)))
 
   def testReducingFuture_Empty(self):
-    def reducer(arg):
+    def reducer(_):
       self.fail()
     rf = tasklets.ReducingFuture(reducer)
     rf.complete()
     self.assertEqual(rf.get_result(), None)
 
   def testReducingFuture_OneItem(self):
-    def reducer(arg):
+    def reducer(_):
       self.fail()
     rf = tasklets.ReducingFuture(reducer)
     rf.putq(1)
@@ -462,7 +459,7 @@ class TaskletTests(test_utils.DatastoreTest):
     def reducer(arg):
       return sum(arg)
     rf = tasklets.ReducingFuture(reducer)
-    f1 = Future()
+    f1 = tasklets.Future()
     f1.set_exception(ZeroDivisionError())
     rf.putq(f1)
     rf.complete()
@@ -489,7 +486,7 @@ class TaskletTests(test_utils.DatastoreTest):
 
   def testReducingFuture_ReducerFuture_1(self):
     def reducer(arg):
-      f = Future()
+      f = tasklets.Future()
       f.set_result(sum(arg))
       return f
     rf = tasklets.ReducingFuture(reducer, batch_size=2)
@@ -503,7 +500,7 @@ class TaskletTests(test_utils.DatastoreTest):
     def reducer(arg):
       res = sum(arg)
       if len(arg) < 3:
-        f = Future()
+        f = tasklets.Future()
         f.set_result(res)
         res = f
       return res
@@ -543,11 +540,12 @@ class TaskletTests(test_utils.DatastoreTest):
     self.assertEqual(y, 5)
 
   def testTasklets_Raising(self):
+    self.ExpectWarnings()
     @tasklets.tasklet
     def t1():
       f = t2(True)
       try:
-        a = yield f
+        yield f
       except RuntimeError, err:
         self.assertEqual(f.get_exception(), err)
         raise tasklets.Return(str(err))
@@ -592,8 +590,7 @@ class TaskletTests(test_utils.DatastoreTest):
       yield tasklets.sleep(0)
     @tasklets.tasklet
     def bad():
-      1/0
-      yield tasklets.sleep(0)
+      raise ZeroDivisionError
     @tasklets.tasklet
     def foo():
       try:
@@ -604,28 +601,49 @@ class TaskletTests(test_utils.DatastoreTest):
     foo().check_success()
 
   def testTasklet_YieldTupleTypeError(self):
+    self.ExpectWarnings()
     @tasklets.tasklet
     def good():
       yield tasklets.sleep(0)
     @tasklets.tasklet
     def bad():
-      1/0
+      raise ZeroDivisionError
       yield tasklets.sleep(0)
     @tasklets.tasklet
     def foo():
       try:
         yield good(), bad(), 42
-      except AssertionError:  # TODO: Maybe TypeError?
+      except TypeError:
         pass
       else:
-        self.assertFalse('Should have raised AssertionError')
+        self.assertFalse('Should have raised TypeError')
     foo().check_success()
 
+  def testMultiSingleCombinationYield(self):
+    @tasklets.tasklet
+    def foo():
+      class Test(model.Model):
+        k = model.KeyProperty()
+        ks = model.KeyProperty(repeated=True)
 
-class TracebackTests(unittest.TestCase):
+      t = Test()
+      t.put()
+
+      t1 = Test(k=t.key, ks=[t.key, t.key])
+      t1.put()
+
+      t1 = t1.key.get()
+      obj, objs = yield t1.k.get_async(), model.get_multi_async(t1.ks)
+      self.assertEqual(obj.key, t1.k)
+      self.assertEqual([obj.key for obj in objs], t1.ks)
+
+    foo().get_result()
+
+class TracebackTests(test_utils.NDBTest):
   """Checks that errors result in reasonable tracebacks."""
 
   def testBasicError(self):
+    self.ExpectWarnings()
     frames = [sys._getframe()]
     @tasklets.tasklet
     def level3():

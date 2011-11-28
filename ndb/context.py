@@ -1,29 +1,31 @@
 """Context class."""
 
-# TODO: Handle things like request size limits.  E.g. what if we've
-# batched up 1000 entities to put and now the memcache call fails?
-
 import logging
 import sys
 
 from google.appengine.api import datastore  # For taskqueue coordination
 from google.appengine.api import datastore_errors
 from google.appengine.api import memcache
-
+from google.appengine.api import namespace_manager
 from google.appengine.datastore import datastore_rpc
+from google.appengine.datastore import entity_pb
+
+from google.net.proto import ProtocolBuffer
 
 from . import key as key_module
-from . import model, tasklets, eventloop, utils
+from . import model
+from . import tasklets
+from . import eventloop
+from . import utils
 
-_LOCK_TIME = 32  # Time to lock out memcache.add() after datastore.put().
+logging_debug = utils.logging_debug
+
+_LOCK_TIME = 32  # Time to lock out memcache.add() after datastore updates.
+_LOCKED = 0  # Special value to store in memcache indicating locked value.
 
 
-class ContextOptions(datastore_rpc.Configuration):
+class ContextOptions(datastore_rpc.TransactionOptions):
   """Configuration options that may be passed along with get/put/delete."""
-
-  # TODO: Remove this method once datastore_rpc.Configuration implements it.
-  def __hash__(self):
-    return hash(frozenset(self._values.iteritems()))
 
   @datastore_rpc.ConfigOption
   def use_cache(value):
@@ -53,18 +55,22 @@ class ContextOptions(datastore_rpc.Configuration):
         'memcache_timeout should be an integer (%r)' % (value,))
     return value
 
+  @datastore_rpc.ConfigOption
+  def max_memcache_items(value):
+    if not isinstance(value, (int, long)):
+      raise datastore_errors.BadArgumentError(
+        'max_memcache_items should be an integer (%r)' % (value,))
+    return value
 
-# For backwards compatibility, translate these option names.
+
+# options and config can be used interchangeably.
 _OPTION_TRANSLATIONS = {
   'options': 'config',
-  'ndb_should_cache': 'use_cache',
-  'ndb_should_memcache': 'use_memcache',
-  'ndb_memcache_timeout': 'memcache_timeout',
 }
 
 
 def _make_ctx_options(ctx_options):
-  """Helper to construct a ContextOptions object from keyword arguents.
+  """Helper to construct a ContextOptions object from keyword arguments.
 
   Args:
     ctx_options: a dict of keyword arguments.
@@ -81,251 +87,193 @@ def _make_ctx_options(ctx_options):
   for key in list(ctx_options):
     translation = _OPTION_TRANSLATIONS.get(key)
     if translation:
-      assert translation not in ctx_options, (key, translation)
-      if key.startswith('ndb_'):
-        logging.warning('Context option %s is deprecated; use %s instead',
-                        key, translation)
+      if translation in ctx_options:
+        raise ValueError('Cannot specify %s and %s at the same time' %
+                         (key, translation))
       ctx_options[translation] = ctx_options.pop(key)
   return ContextOptions(**ctx_options)
 
 
 class AutoBatcher(object):
 
-  def __init__(self, todo_tasklet):
+  def __init__(self, todo_tasklet, limit):
     # todo_tasklet is a tasklet to be called with list of (future, arg) pairs
     self._todo_tasklet = todo_tasklet
-    self._todo = []  # List of (future, arg) pairs
-    self._running = None  # Currently running tasklet, if any
+    self._limit = limit  # No more than this many per callback
+    self._queues = {}  # Map options to lists of (future, arg) tuples
+    self._running = []  # Currently running tasklets
+    self._cache = {}  # Cache of in-flight todo_tasklet futures
 
   def __repr__(self):
     return '%s(%s)' % (self.__class__.__name__, self._todo_tasklet.__name__)
 
-  def add(self, arg, options):
+  def run_queue(self, options, todo):
+    logging_debug('AutoBatcher(%s): %d items',
+                  self._todo_tasklet.__name__, len(todo))
+    fut = self._todo_tasklet(todo, options)
+    self._running.append(fut)
+    # Add a callback when we're done.
+    fut.add_callback(self._finished_callback, fut)
+
+  def _on_idle(self):
+    if not self.action():
+      return None
+    return True
+
+  def add(self, arg, options=None):
     fut = tasklets.Future('%s.add(%s, %s)' % (self, arg, options))
-    if not self._todo:  # Schedule the callback
-      # We use the fact that regular tasklets are queued at time None,
-      # which puts them at absolute time 0 (i.e. ASAP -- still on a
-      # FIFO basis).  Callbacks explicitly scheduled with a delay of 0
-      # are only run after all immediately runnable tasklets have run.
-      eventloop.queue_call(0, self._autobatcher_callback)
-    self._todo.append((fut, arg, options))
+    todo = self._queues.get(options)
+    if todo is None:
+      logging_debug('AutoBatcher(%s): creating new queue for %r',
+                    self._todo_tasklet.__name__, options)
+      if not self._queues:
+        eventloop.add_idle(self._on_idle)
+      todo = self._queues[options] = []
+    todo.append((fut, arg))
+    if len(todo) >= self._limit:
+      del self._queues[options]
+      self.run_queue(options, todo)
     return fut
 
-  def _autobatcher_callback(self):
-    if not self._todo:
-      return
-    if self._running is not None:
-      # Another callback may still be running.
-      if not self._running.done():
-        # Wait for it to complete first, then try again.
-        self._running.add_callback(self._autobatcher_callback)
-        return
-      self._running = None
-    # We cannot postpone the inevitable any longer.
-    todo = self._todo
-    self._todo = []  # Get ready for the next batch
-    # TODO: Use logging_debug(), at least if len(todo) == 1.
-    logging.info('AutoBatcher(%s): %d items',
-                 self._todo_tasklet.__name__, len(todo))
-    self._running = self._todo_tasklet(todo)
-    # Add a callback to the Future to propagate exceptions,
-    # since this Future is not normally checked otherwise.
-    self._running.add_callback(self._running.check_success)
+  def add_once(self, arg, options=None):
+    cache_key = (arg, options)
+    fut = self._cache.get(cache_key)
+    if fut is None:
+      fut = self.add(arg, options)
+      self._cache[cache_key] = fut
+      fut.add_immediate_callback(self._cache.__delitem__, cache_key)
+    return fut
+
+  def action(self):
+    queues = self._queues
+    if not queues:
+      return False
+    options, todo = queues.popitem()  # TODO: Should this use FIFO ordering?
+    self.run_queue(options, todo)
+    return True
+
+  def _finished_callback(self, fut):
+    self._running.remove(fut)
+    fut.check_success()
 
   @tasklets.tasklet
   def flush(self):
-    while self._running or self._todo:
+    while self._running or self.action():
       if self._running:
-        if self._running.done():
-          self._running.check_success()
-          self._running = None
-        else:
-          yield self._running
-      else:
-        self._autobatcher_callback()
+        yield self._running  # A list of Futures
 
 
 class Context(object):
 
   def __init__(self, conn=None, auto_batcher_class=AutoBatcher, config=None):
+    # NOTE: If conn is not None, config is only used to get the
+    # auto-batcher limits.
     if conn is None:
       conn = model.make_connection(config)
-    else:
-      assert config is None  # It wouldn't be used.
     self._conn = conn
     self._auto_batcher_class = auto_batcher_class
-    self._get_batcher = auto_batcher_class(self._get_tasklet)
-    self._put_batcher = auto_batcher_class(self._put_tasklet)
-    self._delete_batcher = auto_batcher_class(self._delete_tasklet)
+    # Get the get/put/delete limits (defaults 1000, 500, 500).
+    # Note that the explicit config passed in overrides the config
+    # attached to the connection, if it was passed in.
+    max_get = (datastore_rpc.Configuration.max_get_keys(config, conn.config) or
+               datastore_rpc.Connection.MAX_GET_KEYS)
+    max_put = (datastore_rpc.Configuration.max_put_entities(config,
+                                                            conn.config) or
+               datastore_rpc.Connection.MAX_PUT_ENTITIES)
+    max_delete = (datastore_rpc.Configuration.max_delete_keys(config,
+                                                              conn.config) or
+                  datastore_rpc.Connection.MAX_DELETE_KEYS)
+    # Create the get/put/delete auto-batchers.
+    self._get_batcher = auto_batcher_class(self._get_tasklet, max_get)
+    self._put_batcher = auto_batcher_class(self._put_tasklet, max_put)
+    self._delete_batcher = auto_batcher_class(self._delete_tasklet, max_delete)
+    # We only have a single limit for memcache (default 1000).
+    max_memcache = (ContextOptions.max_memcache_items(config, conn.config) or
+                    datastore_rpc.Connection.MAX_GET_KEYS)
+    # Create the memcache auto-batchers.
+    self._memcache_get_batcher = auto_batcher_class(self._memcache_get_tasklet,
+                                                    max_memcache)
+    self._memcache_set_batcher = auto_batcher_class(self._memcache_set_tasklet,
+                                                    max_memcache)
+    self._memcache_del_batcher = auto_batcher_class(self._memcache_del_tasklet,
+                                                    max_memcache)
+    self._memcache_off_batcher = auto_batcher_class(self._memcache_off_tasklet,
+                                                    max_memcache)
+    # Create a list of batchers for flush().
+    self._batchers = [self._get_batcher,
+                      self._put_batcher,
+                      self._delete_batcher,
+                      self._memcache_get_batcher,
+                      self._memcache_set_batcher,
+                      self._memcache_del_batcher,
+                      self._memcache_off_batcher,
+                      ]
     self._cache = {}
+    self._memcache = memcache.Client()
 
-  # TODO: Set proper namespace for memcache.
-
-  _memcache_prefix = 'NDB:'  # TODO: Might make this configurable.
+  # NOTE: The default memcache prefix is altered if an incompatible change is
+  # required. Remember to check release notes when using a custom prefix.
+  _memcache_prefix = 'NDB9:'  # TODO: Might make this configurable.
 
   @tasklets.tasklet
   def flush(self):
-    yield (self._get_batcher.flush(),
-           self._put_batcher.flush(),
-           self._delete_batcher.flush())
+    # Rinse and repeat until all batchers are completely out of work.
+    more = True
+    while more:
+      yield [batcher.flush() for batcher in self._batchers]
+      more = False
+      for batcher in self._batchers:
+        if batcher._running or batcher._queues:
+          more = True
+          break
 
   @tasklets.tasklet
-  def _get_tasklet(self, todo):
-    assert todo
-    # First check memcache.
-    memkeymap = {}
-    for fut, key, options in todo:
-      if self._use_memcache(key, options):
-        memkeymap[key] = key.urlsafe()
-    if memkeymap:
-      results = memcache.get_multi(memkeymap.values(),
-                                   key_prefix=self._memcache_prefix)
-      leftover = []
-      for fut, key, options in todo:
-        mkey = memkeymap.get(key)
-        if mkey is not None and mkey in results:
-          pb = results[mkey]
-          ent = self._conn.adapter.pb_to_entity(pb)
-          fut.set_result(ent)
-        else:
-          leftover.append((fut, key, options))
-      todo = leftover
-    # Segregate things by ConfigOptions.
-    by_options = {}
-    for fut, key, options in todo:
-      if options in by_options:
-        futures, keys = by_options[options]
-      else:
-        futures, keys = by_options[options] = [], []
-      futures.append(fut)
-      keys.append(key)
-    # Make the RPC calls.
-    mappings = {}  # Maps timeout value to {urlsafe_key: pb} mapping.
-    for options, (futures, keys) in by_options.iteritems():
-      datastore_futures = []
-      datastore_keys = []
-      for fut, key in zip(futures, keys):
-        if self._use_datastore(key, options):
-          datastore_keys.append(key)
-          datastore_futures.append(fut)
-        else:
-          fut.set_result(None)
-      if datastore_keys:
-        entities = yield self._conn.async_get(options, datastore_keys)
-        for ent, fut, key in zip(entities, datastore_futures, datastore_keys):
-          fut.set_result(ent)
-          if ent is not None and self._use_memcache(key, options):
-            pb = self._conn.adapter.entity_to_pb(ent)
-            timeout = self._get_memcache_timeout(key, options)
-            mapping = mappings.get(timeout)
-            if mapping is None:
-              mapping = mappings[timeout] = {}
-            mapping[ent._key.urlsafe()] = pb
-    if mappings:
-      # If the timeouts are not uniform, make a separate call for each
-      # distinct timeout value.
-      for timeout, mapping in mappings.iteritems():
-        # Use add, not set.  This is a no-op within _LOCK_TIME seconds
-        # of the delete done by the most recent write.
-        memcache.add_multi(mapping, time=timeout,
-                           key_prefix=self._memcache_prefix)
+  def _get_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    # Make the datastore RPC call.
+    datastore_keys = []
+    for unused_fut, key in todo:
+      datastore_keys.append(key)
+    # Now wait for the datastore RPC(s) and pass the results to the futures.
+    entities = yield self._conn.async_get(options, datastore_keys)
+    for ent, (fut, unused_key) in zip(entities, todo):
+      fut.set_result(ent)
 
   @tasklets.tasklet
-  def _put_tasklet(self, todo):
-    assert todo
+  def _put_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
     # TODO: What if the same entity is being put twice?
     # TODO: What if two entities with the same key are being put?
-    by_options = {}
-    delete_keys = []  # For memcache.delete_multi().
-    mappings = {}  # For memcache.set_multi(), segregated by timeout.
-    for fut, ent, options in todo:
-      if ent._has_complete_key():
-        if self._use_memcache(ent._key, options):
-          if self._use_datastore(ent._key, options):
-            delete_keys.append(ent._key.urlsafe())
-          else:
-            pb = self._conn.adapter.entity_to_pb(ent)
-            timeout = self._get_memcache_timeout(ent._key, options)
-            mapping = mappings.get(timeout)
-            if mapping is None:
-              mapping = mappings[timeout] = {}
-            mapping[ent._key.urlsafe()] = pb
-      else:
-        key = ent._key
-        if key is None:
-          # Create a dummy Key to call _use_datastore().
-          key = model.Key(ent.__class__, None)
-        if not self._use_datastore(key, options):
+    datastore_entities = []
+    for unused_fut, ent in todo:
+      datastore_entities.append(ent)
+    # Wait for datastore RPC(s).
+    keys = yield self._conn.async_put(options, datastore_entities)
+    for key, (fut, ent) in zip(keys, todo):
+      if key != ent._key:
+        if ent._has_complete_key():
           raise datastore_errors.BadKeyError(
-              'Cannot put incomplete key when use_datastore=False.')
-      if options in by_options:
-        futures, entities = by_options[options]
-      else:
-        futures, entities = by_options[options] = [], []
-      futures.append(fut)
-      entities.append(ent)
-    if delete_keys:  # Pre-emptively delete from memcache.
-      memcache.delete_multi(delete_keys, seconds=_LOCK_TIME,
-                            key_prefix=self._memcache_prefix)
-    if mappings:  # Write to memcache (only if use_datastore=False).
-      # If the timeouts are not uniform, make a separate call for each
-      # distinct timeout value.
-      for timeout, mapping in mappings.iteritems():
-        # Use add, not set.  This is a no-op within _LOCK_TIME seconds
-        # of the delete done by the most recent write.
-        memcache.add_multi(mapping, time=timeout,
-                           key_prefix=self._memcache_prefix)
-    for options, (futures, entities) in by_options.iteritems():
-      datastore_futures = []
-      datastore_entities = []
-      for fut, ent in zip(futures, entities):
-        key = ent._key
-        if key is None:
-          # Pass a dummy Key to _use_datastore().
-          key = model.Key(ent.__class__, None)
-        if self._use_datastore(key, options):
-          datastore_futures.append(fut)
-          datastore_entities.append(ent)
-        else:
-          # TODO: If ent._key is None, this is really lame.
-          fut.set_result(ent._key)
-      if datastore_entities:
-        keys = yield self._conn.async_put(options, datastore_entities)
-        for key, fut, ent in zip(keys, datastore_futures, datastore_entities):
-          if key != ent._key:
-            if ent._has_complete_key():
-              raise datastore_errors.BadKeyError(
-                  'Entity key differs from the one returned by the datastore. '
-                  'Expected %r, got %r' % (key, ent._key))
-            ent._key = key
-          fut.set_result(key)
+              'Entity key differs from the one returned by the datastore. '
+              'Expected %r, got %r' % (key, ent._key))
+        ent._key = key
+      fut.set_result(key)
 
   @tasklets.tasklet
-  def _delete_tasklet(self, todo):
-    assert todo
-    by_options = {}
-    delete_keys = []  # For memcache.delete_multi()
-    for fut, key, options in todo:
-      if self._use_memcache(key, options):
-        delete_keys.append(key.urlsafe())
-      if options in by_options:
-        futures, keys = by_options[options]
-      else:
-        futures, keys = by_options[options] = [], []
+  def _delete_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    futures = []
+    datastore_keys = []
+    for fut, key in todo:
       futures.append(fut)
-      keys.append(key)
-    if delete_keys:  # Pre-emptively delete from memcache.
-      memcache.delete_multi(delete_keys, seconds=_LOCK_TIME,
-                            key_prefix=self._memcache_prefix)
-    for options, (futures, keys) in by_options.iteritems():
-      datastore_keys = []
-      for key in keys:
-        if self._use_datastore(key, options):
-          datastore_keys.append(key)
-      if datastore_keys:
-        yield self._conn.async_delete(options, datastore_keys)
-      for fut in futures:
-        fut.set_result(None)
+      datastore_keys.append(key)
+    # Wait for datastore RPC(s).
+    yield self._conn.async_delete(options, datastore_keys)
+    # Send a dummy result to all original Futures.
+    for fut in futures:
+      fut.set_result(None)
 
   # TODO: Unify the policy docstrings (they're getting too verbose).
 
@@ -383,7 +331,7 @@ class Context(object):
     if func is None:
       func = self.default_cache_policy
     elif isinstance(func, bool):
-      func = lambda key, flag=func: flag
+      func = lambda unused_key, flag=func: flag
     self._cache_policy = func
 
   def _use_cache(self, key, options=None):
@@ -450,7 +398,7 @@ class Context(object):
     if func is None:
       func = self.default_memcache_policy
     elif isinstance(func, bool):
-      func = lambda key, flag=func: flag
+      func = lambda unused_key, flag=func: flag
     self._memcache_policy = func
 
   def _use_memcache(self, key, options=None):
@@ -517,7 +465,7 @@ class Context(object):
     if func is None:
       func = self.default_datastore_policy
     elif isinstance(func, bool):
-      func = lambda key, flag=func: flag
+      func = lambda unused_key, flag=func: flag
     self._datastore_policy = func
 
   def _use_datastore(self, key, options=None):
@@ -552,7 +500,7 @@ class Context(object):
       Memcache timeout to use (integer), or None.
     """
     timeout = None
-    if key is not None:
+    if key is not None and isinstance(key, model.Key):
       modelclass = model.Model._kind_map.get(key.kind())
       if modelclass is not None:
         policy = getattr(modelclass, '_memcache_timeout', None)
@@ -577,7 +525,7 @@ class Context(object):
     if func is None:
       func = self.default_memcache_timeout_policy
     elif isinstance(func, (int, long)):
-      func = lambda key, flag=func: flag
+      func = lambda unused_key, flag=func: flag
     self._memcache_timeout_policy = func
 
   def get_memcache_timeout_policy(self):
@@ -618,20 +566,96 @@ class Context(object):
     """
     options = _make_ctx_options(ctx_options)
     use_cache = self._use_cache(key, options)
-    if use_cache and key in self._cache:
-      entity = self._cache[key]  # May be None, meaning "doesn't exist".
-      if entity is None or entity._key == key:
-        # If entity's key didn't change later, it is ok. See issue #13.
-        raise tasklets.Return(entity)
-    entity = yield self._get_batcher.add(key, options)
     if use_cache:
-      self._cache[key] = entity
+      if key in self._cache:
+        entity = self._cache[key]  # May be None, meaning "doesn't exist".
+        if entity is None or entity._key == key:
+          # If entity's key didn't change later, it is ok.
+          # See issue #13.  http://goo.gl/jxjOP
+          raise tasklets.Return(entity)
+
+    use_datastore = self._use_datastore(key, options)
+    use_memcache = self._use_memcache(key, options)
+    using_tconn = isinstance(self._conn, datastore_rpc.TransactionalConnection)
+    in_transaction = (use_datastore and using_tconn)
+    ns = key.namespace()
+
+    if use_memcache and not in_transaction:
+      mkey = self._memcache_prefix + key.urlsafe()
+      mvalue = yield self.memcache_get(mkey, for_cas=use_datastore,
+                                       namespace=ns, use_cache=True)
+      if mvalue not in (_LOCKED, None):
+        cls = model.Model._kind_map.get(key.kind())
+        if cls is None:
+          raise TypeError('Cannot find model class for kind %s' % key.kind())
+        pb = entity_pb.EntityProto()
+
+        try:
+          pb.MergePartialFromString(mvalue)
+        except ProtocolBuffer.ProtocolBufferDecodeError:
+          logging.warning('Corrupt memcache entry found '
+                          'with key %s and namespace %s' % (mkey, ns))
+          mvalue = None
+        else:
+          entity = cls._from_pb(pb)
+          # Store the key on the entity since it wasn't written to memcache.
+          entity._key = key
+          raise tasklets.Return(entity)
+
+      if mvalue is None and use_datastore:
+        yield self.memcache_set(mkey, _LOCKED, time=_LOCK_TIME, namespace=ns,
+                                use_cache=True)
+        yield self.memcache_gets(mkey, namespace=ns, use_cache=True)
+    if not use_datastore:
+      raise tasklets.Return(None)
+
+    if use_cache:
+      entity = yield self._get_batcher.add_once(key, options)
+    else:
+      entity = yield self._get_batcher.add(key, options)
+
+    if entity is not None:
+      if not in_transaction and use_memcache and mvalue != _LOCKED:
+        # Don't serialize the key since it's already the memcache key.
+        pbs = entity._to_pb(set_key=False).SerializePartialToString()
+        timeout = self._get_memcache_timeout(key, options)
+        # Don't yield -- this can run in the background.
+        self.memcache_cas(mkey, pbs, time=timeout, namespace=ns)
+      if use_cache:
+        self._cache[key] = entity
     raise tasklets.Return(entity)
 
   @tasklets.tasklet
   def put(self, entity, **ctx_options):
     options = _make_ctx_options(ctx_options)
-    key = yield self._put_batcher.add(entity, options)
+    # TODO: What if the same entity is being put twice?
+    # TODO: What if two entities with the same key are being put?
+    key = entity._key
+    if key is None:
+      # Pass a dummy Key to _use_datastore().
+      key = model.Key(entity.__class__, None)
+    use_datastore = self._use_datastore(key, options)
+
+    if entity._has_complete_key():
+      if self._use_memcache(key, options):
+        # Wait for memcache operations before starting datastore RPCs.
+        mkey = self._memcache_prefix + key.urlsafe()
+        ns = key.namespace()
+        if use_datastore:
+          yield self.memcache_set(mkey, _LOCKED, time=_LOCK_TIME,
+                                  namespace=ns, use_cache=True)
+        else:
+          pbs = entity._to_pb(set_key=False).SerializePartialToString()
+          timeout = self._get_memcache_timeout(key, options)
+          yield self.memcache_set(mkey, pbs, time=timeout, namespace=ns)
+
+    if use_datastore:
+      key = yield self._put_batcher.add(entity, options)
+      if self._use_memcache(key, options):
+        mkey = self._memcache_prefix + key.urlsafe()
+        ns = key.namespace()
+        yield self.memcache_delete(mkey, namespace=ns)
+
     if key is not None:
       if entity._key != key:
         logging.info('replacing key %s with %s', entity._key, key)
@@ -640,13 +664,22 @@ class Context(object):
       if self._use_cache(key, options):
         # TODO: What if by now the entity is already in the cache?
         self._cache[key] = entity
+
     raise tasklets.Return(key)
 
   @tasklets.tasklet
   def delete(self, key, **ctx_options):
     options = _make_ctx_options(ctx_options)
-    yield self._delete_batcher.add(key, options)
-    if self._use_cache(key, options) and key in self._cache:
+    if self._use_memcache(key, options):
+      mkey = self._memcache_prefix + key.urlsafe()
+      ns = key.namespace()
+      yield self.memcache_set(mkey, _LOCKED, time=_LOCK_TIME, namespace=ns,
+                              use_cache=True)
+
+    if self._use_datastore(key, options):
+      yield self._delete_batcher.add(key, options)
+
+    if self._use_cache(key, options):
       self._cache[key] = None
 
   @tasklets.tasklet
@@ -680,7 +713,8 @@ class Context(object):
               hit = self._cache[key]
               if hit is not None and hit.key != key:
                 # The cached entry has been mutated to have a different key.
-                # That's a false hit.  Get rid of it.  See issue #13.
+                # That's a false hit.  Get rid of it.
+                # See issue #13.  http://goo.gl/jxjOP
                 del self._cache[key]
             if key in self._cache:
               # Assume the cache is more up to date.
@@ -727,29 +761,35 @@ class Context(object):
                           merge_future=tasklets.SerialQueueFuture())
 
   @tasklets.tasklet
-  def transaction(self, callback, retry=3, entity_group=None, **ctx_options):
+  def transaction(self, callback, **ctx_options):
     # Will invoke callback() one or more times with the default
     # context set to a new, transactional Context.  Returns a Future.
     # Callback may be a tasklet.
     options = _make_ctx_options(ctx_options)
-    if entity_group is not None:
-      app = entity_group.app()
-    else:
-      app = key_module._DefaultAppId()
+    app = ContextOptions.app(options) or key_module._DefaultAppId()
+    # Note: zero retries means try it once.
+    retries = ContextOptions.retries(options)
+    if retries is None:
+      retries = 3
     yield self.flush()
-    for i in range(1 + max(0, retry)):
+    for _ in xrange(1 + max(0, retries)):
       transaction = yield self._conn.async_begin_transaction(options, app)
       tconn = datastore_rpc.TransactionalConnection(
         adapter=self._conn.adapter,
         config=self._conn.config,
-        transaction=transaction,
-        entity_group=entity_group)
+        transaction=transaction)
+      old_ds_conn = datastore._GetConnection()
       tctx = self.__class__(conn=tconn,
                             auto_batcher_class=self._auto_batcher_class)
-      tctx.set_memcache_policy(False)
-      tasklets.set_context(tctx)
-      old_ds_conn = datastore._GetConnection()
       try:
+        # Copy memcache policies.  Note that get() will never use
+        # memcache in a transaction, but put and delete should do their
+        # memcache thing (which is to mark the key as deleted for
+        # _LOCK_TIME seconds).  Also note that the in-process cache and
+        # datastore policies keep their default (on) state.
+        tctx.set_memcache_policy(self.get_memcache_policy())
+        tctx.set_memcache_timeout_policy(self.get_memcache_timeout_policy())
+        tasklets.set_context(tctx)
         datastore._SetConnection(tconn)  # For taskqueue coordination
         try:
           try:
@@ -758,7 +798,7 @@ class Context(object):
               result = yield result
           finally:
             yield tctx.flush()
-        except Exception, err:
+        except Exception:
           t, e, tb = sys.exc_info()
           yield tconn.async_rollback(options)  # TODO: Don't block???
           if issubclass(t, datastore_errors.Rollback):
@@ -770,7 +810,7 @@ class Context(object):
           if ok:
             # TODO: This is questionable when self is transactional.
             self._cache.update(tctx._cache)
-            self._clear_memcache(tctx._cache)
+            yield self._clear_memcache(tctx._cache)
             raise tasklets.Return(result)
       finally:
         datastore._SetConnection(old_ds_conn)
@@ -789,23 +829,47 @@ class Context(object):
     NOTE: This does not affect memcache.
     """
     self._cache.clear()
-
-  # Backwards compatible alias.
-  flush_cache = clear_cache  # TODO: Remove this after one release.
-
-  def _clear_memcache(self, keys):
-    keys = set(key for key in keys if self._use_memcache(key))
-    if keys:
-      memkeys = [key.urlsafe() for key in keys]
-      memcache.delete_multi(memkeys, key_prefix=self._memcache_prefix)
+    self._get_queue.clear()
 
   @tasklets.tasklet
-  def get_or_insert(self, model_class, name,
-                    app=None, namespace=None, parent=None,
-                    context_options=None,
-                    **kwds):
+  def _clear_memcache(self, keys):
+    # Note: This doesn't technically *clear* the keys; it locks them.
+    keys = set(key for key in keys if self._use_memcache(key))
+    futures = []
+    for key in keys:
+      mkey = self._memcache_prefix + key.urlsafe()
+      ns = key.namespace()
+      fut = self.memcache_set(mkey, _LOCKED, time=_LOCK_TIME, namespace=ns,
+                              use_cache=True)
+      futures.append(fut)
+    yield futures
+
+  @tasklets.tasklet
+  def get_or_insert(*args, **kwds):
+    # NOTE: The signature is really weird here because we want to support
+    # models with properties named e.g. 'self' or 'name'.
+    self, model_class, name = args  # These must always be positional.
+    our_kwds = {}
+    for kwd in 'app', 'namespace', 'parent', 'context_options':
+      # For each of these keyword arguments, if there is a property
+      # with the same name, the caller *must* use _foo=..., otherwise
+      # they may use either _foo=... or foo=..., but _foo=... wins.
+      alt_kwd = '_' + kwd
+      if alt_kwd in kwds:
+        our_kwds[kwd] = kwds.pop(alt_kwd)
+      elif (kwd in kwds and
+          not isinstance(getattr(model_class, kwd, None), model.Property)):
+        our_kwds[kwd] = kwds.pop(kwd)
+    app = our_kwds.get('app')
+    namespace = our_kwds.get('namespace')
+    parent = our_kwds.get('parent')
+    context_options = our_kwds.get('context_options')
+    # (End of super-special argument parsing.)
     # TODO: Test the heck out of this, in all sorts of evil scenarios.
-    assert isinstance(name, basestring) and name
+    if not isinstance(name, basestring):
+      raise TypeError('name must be a string; received %r' % name)
+    elif not name:
+      raise ValueError('name cannot be an empty string.')
     key = model.Key(model_class, name,
                     app=app, namespace=namespace, parent=parent)
     # TODO: Can (and should) the cache be trusted here?
@@ -822,6 +886,183 @@ class Context(object):
       ent = yield self.transaction(txn)
     raise tasklets.Return(ent)
 
+  @tasklets.tasklet
+  def _memcache_get_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    for_cas, namespace = options
+    keys = set()
+    for unused_fut, key in todo:
+      keys.add(key)
+    results = yield self._memcache.get_multi_async(keys, for_cas=for_cas,
+                                                   namespace=namespace)
+    for fut, key in todo:
+      fut.set_result(results.get(key))
+
+  @tasklets.tasklet
+  def _memcache_set_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    opname, time, namespace = options
+    methodname = opname + '_multi_async'
+    method = getattr(self._memcache, methodname)
+    mapping = {}
+    for unused_fut, (key, value) in todo:
+      mapping[key] = value
+    results = yield method(mapping, time=time, namespace=namespace)
+    for fut, (key, unused_value) in todo:
+      if results is None:
+        status = memcache.MemcacheSetResponse.ERROR
+      else:
+        status = results.get(key)
+      fut.set_result(status == memcache.MemcacheSetResponse.STORED)
+
+  @tasklets.tasklet
+  def _memcache_del_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    seconds, namespace = options
+    keys = set()
+    for unused_fut, key in todo:
+      keys.add(key)
+    statuses = yield self._memcache.delete_multi_async(keys, seconds=seconds,
+                                                       namespace=namespace)
+    status_key_mapping = {}
+    if statuses:  # On network error, statuses is None.
+      for key, status in zip(keys, statuses):
+        status_key_mapping[key] = status
+    for fut, key in todo:
+      status = status_key_mapping.get(key, memcache.DELETE_NETWORK_FAILURE)
+      fut.set_result(status)
+
+  @tasklets.tasklet
+  def _memcache_off_tasklet(self, todo, options):
+    if not todo:
+      raise RuntimeError('Nothing to do.')
+    initial_value, namespace = options
+    mapping = {}  # {key: delta}
+    for unused_fut, (key, delta) in todo:
+      mapping[key] = delta
+    results = yield self._memcache.offset_multi_async(mapping,
+                               initial_value=initial_value, namespace=namespace)
+    for fut, (key, unused_delta) in todo:
+      result = results.get(key)
+      if isinstance(result, basestring):
+        # See http://code.google.com/p/googleappengine/issues/detail?id=2012
+        # We can fix this without waiting for App Engine to fix it.
+        result = int(result)
+      fut.set_result(result)
+
+  def memcache_get(self, key, for_cas=False, namespace=None, use_cache=False):
+    """An auto-batching wrapper for memcache.get() or .get_multi().
+
+    Args:
+      key: Key to set.  This must be a string; no prefix is applied.
+      for_cas: If True, request and store CAS ids on the Context.
+      namespace: Optional namespace.
+
+    Returns:
+      A Future (!) whose return value is the value retrieved from
+      memcache, or None.
+    """
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(for_cas, bool):
+      raise ValueError('for_cas must be a bool; received %r' % for_cas)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    options = (for_cas, namespace)
+    batcher = self._memcache_get_batcher
+    if use_cache:
+      return batcher.add_once(key, options)
+    else:
+      return batcher.add(key, options)
+
+  # XXX: Docstrings below.
+
+  def memcache_gets(self, key, namespace=None, use_cache=False):
+    return self.memcache_get(key, for_cas=True, namespace=namespace,
+                             use_cache=use_cache)
+
+  def memcache_set(self, key, value, time=0, namespace=None, use_cache=False):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(time, (int, long)):
+      raise ValueError('time must be a number; received %r' % time)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    options = ('set', time, namespace)
+    batcher = self._memcache_set_batcher
+    if use_cache:
+      return batcher.add_once((key, value), options)
+    else:
+      return batcher.add((key, value), options)
+
+  def memcache_add(self, key, value, time=0, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(time, (int, long)):
+      raise ValueError('time must be a number; received %r' % time)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_set_batcher.add((key, value),
+                                          ('add', time, namespace))
+
+  def memcache_replace(self, key, value, time=0, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(time, (int, long)):
+      raise ValueError('time must be a number; received %r' % time)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_set_batcher.add((key, value),
+                                          ('replace', time, namespace))
+
+  def memcache_cas(self, key, value, time=0, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(time, (int, long)):
+      raise ValueError('time must be a number; received %r' % time)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_set_batcher.add((key, value),
+                                          ('cas', time, namespace))
+
+  def memcache_delete(self, key, seconds=0, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(seconds, (int, long)):
+      raise ValueError('seconds must be a number; received %r' % seconds)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_del_batcher.add(key, (seconds, namespace))
+
+  def memcache_incr(self, key, delta=1, initial_value=None, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(delta, (int, long)):
+      raise ValueError('delta must be a number; received %r' % delta)
+    if initial_value is not None and not isinstance(initial_value, (int, long)):
+      raise ValueError('initial_value must be a number or None; received %r' %
+                       initial_value)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_off_batcher.add((key, delta),
+                                          (initial_value, namespace))
+
+  def memcache_decr(self, key, delta=1, initial_value=None, namespace=None):
+    if not isinstance(key, str):
+      raise TypeError('key must be a string; received %r' % key)
+    if not isinstance(delta, (int, long)):
+      raise ValueError('delta must be a number; received %r' % delta)
+    if initial_value is not None and not isinstance(initial_value, (int, long)):
+      raise ValueError('initial_value must be a number or None; received %r' %
+                       initial_value)
+    if namespace is None:
+      namespace = namespace_manager.get_namespace()
+    return self._memcache_off_batcher.add((key, -delta),
+                                          (initial_value, namespace))
+
 
 def toplevel(func):
   """A sync tasklet that sets a fresh default Context.
@@ -833,12 +1074,13 @@ def toplevel(func):
   def add_context_wrapper(*args, **kwds):
     __ndb_debug__ = utils.func_info(func)
     tasklets._state.clear_all_pending()
-    # Reset context; a new one will be created on the first call to
-    # get_context().
-    tasklets.set_context(None)
-    ctx = tasklets.get_context()
+    # Create and install a new context.
+    ctx = tasklets.make_default_context()
     try:
+      tasklets.set_context(ctx)
       return tasklets.synctasklet(func)(*args, **kwds)
     finally:
+      tasklets.set_context(None)
+      ctx.flush().check_success()
       eventloop.run()  # Ensure writes are flushed, etc.
   return add_context_wrapper

@@ -7,29 +7,34 @@ import unittest
 from google.appengine.api import datastore_errors
 from google.appengine.datastore import entity_pb
 
+from . import eventloop
 from . import key
+from . import model
+from . import tasklets
+from . import test_utils
 
-class KeyTests(unittest.TestCase):
+
+class KeyTests(test_utils.NDBTest):
 
   def testShort(self):
     k0 = key.Key('Kind', None)
-    self.assertEqual(k0.flat(), ['Kind', None])
+    self.assertEqual(k0.flat(), ('Kind', None))
     k1 = key.Key('Kind', 1)
-    self.assertEqual(k1.flat(), ['Kind', 1])
+    self.assertEqual(k1.flat(), ('Kind', 1))
     k2 = key.Key('Parent', 42, 'Kind', 1)
-    self.assertEqual(k2.flat(), ['Parent', 42, 'Kind', 1])
+    self.assertEqual(k2.flat(), ('Parent', 42, 'Kind', 1))
 
   def testFlat(self):
-    flat = ['Kind', 1]
-    pairs = [(flat[i], flat[i+1]) for i in xrange(0, len(flat), 2)]
+    flat = ('Kind', 1)
+    pairs = tuple((flat[i], flat[i + 1]) for i in xrange(0, len(flat), 2))
     k = key.Key(flat=flat)
     self.assertEqual(k.pairs(), pairs)
     self.assertEqual(k.flat(), flat)
     self.assertEqual(k.kind(), 'Kind')
 
   def testFlatLong(self):
-    flat = ['Kind', 1, 'Subkind', 'foobar']
-    pairs = [(flat[i], flat[i+1]) for i in xrange(0, len(flat), 2)]
+    flat = ('Kind', 1, 'Subkind', 'foobar')
+    pairs = tuple((flat[i], flat[i + 1]) for i in xrange(0, len(flat), 2))
     k = key.Key(flat=flat)
     self.assertEqual(k.pairs(), pairs)
     self.assertEqual(k.flat(), flat)
@@ -64,13 +69,13 @@ class KeyTests(unittest.TestCase):
     self.assertEqual(k.reference(), r)
 
     k = key.Key(reference=r)
-    self.assertTrue(k._reference() is not r)
+    self.assertTrue(k.reference() is not r)
     self.assertEqual(k.serialized(), serialized)
     self.assertEqual(k.urlsafe(), urlsafe)
     self.assertEqual(k.reference(), r)
 
     k = key.Key(reference=r, app=r.app(), namespace='')
-    self.assertTrue(k._reference() is not r)
+    self.assertTrue(k.reference() is not r)
     self.assertEqual(k.serialized(), serialized)
     self.assertEqual(k.urlsafe(), urlsafe)
     self.assertEqual(k.reference(), r)
@@ -127,12 +132,12 @@ class KeyTests(unittest.TestCase):
     self.assertEqual(p.parent(), None)
 
     k = key.Key('Subkind', 'foobar', parent=p)
-    self.assertEqual(k.flat(), ['Kind', 1, 'Subkind', 'foobar'])
+    self.assertEqual(k.flat(), ('Kind', 1, 'Subkind', 'foobar'))
     self.assertEqual(k.parent(), p)
 
     k = key.Key('Subkind', 'foobar', parent=p,
                 app=p.app(), namespace=p.namespace())
-    self.assertEqual(k.flat(), ['Kind', 1, 'Subkind', 'foobar'])
+    self.assertEqual(k.flat(), ('Kind', 1, 'Subkind', 'foobar'))
     self.assertEqual(k.parent(), p)
 
   def testRoot(self):
@@ -140,14 +145,14 @@ class KeyTests(unittest.TestCase):
     self.assertEqual(p.root(), p)
 
     k = key.Key('Subkind', 'foobar', parent=p)
-    self.assertEqual(k.flat(), ['Kind', 1, 'Subkind', 'foobar'])
+    self.assertEqual(k.flat(), ('Kind', 1, 'Subkind', 'foobar'))
     self.assertEqual(k.root(), p)
 
     k2 = key.Key('Subsubkind', 42, parent=k,
                 app=p.app(), namespace=p.namespace())
-    self.assertEqual(k2.flat(), ['Kind', 1,
+    self.assertEqual(k2.flat(), ('Kind', 1,
                                  'Subkind', 'foobar',
-                                 'Subsubkind', 42])
+                                 'Subsubkind', 42))
     self.assertEqual(k2.root(), p)
 
   def testRepr_Inferior(self):
@@ -181,10 +186,10 @@ class KeyTests(unittest.TestCase):
     self.assertEqual(repr(k), "Key('Kind', 1, namespace='foo')")
 
   def testUnicode(self):
-    flat_input = [u'Kind\u1234', 1, 'Subkind', u'foobar\u4321']
-    flat = [flat_input[0].encode('utf8'), flat_input[1],
-            flat_input[2], flat_input[3].encode('utf8')]
-    pairs = [(flat[i], flat[i+1]) for i in xrange(0, len(flat), 2)]
+    flat_input = (u'Kind\u1234', 1, 'Subkind', u'foobar\u4321')
+    flat = (flat_input[0].encode('utf8'), flat_input[1],
+            flat_input[2], flat_input[3].encode('utf8'))
+    pairs = tuple((flat[i], flat[i + 1]) for i in xrange(0, len(flat), 2))
     k = key.Key(flat=flat_input)
     self.assertEqual(k.pairs(), pairs)
     self.assertEqual(k.flat(), flat)
@@ -206,13 +211,12 @@ class KeyTests(unittest.TestCase):
 
   def testHash(self):
     flat = ['Kind', 1, 'Subkind', 'foobar']
-    pairs = [(flat[i], flat[i+1]) for i in xrange(0, len(flat), 2)]
+    pairs = [(flat[i], flat[i + 1]) for i in xrange(0, len(flat), 2)]
     k = key.Key(flat=flat)
     self.assertEqual(hash(k), hash(tuple(pairs)))
 
   def testPickling(self):
     flat = ['Kind', 1, 'Subkind', 'foobar']
-    pairs = [(flat[i], flat[i+1]) for i in xrange(0, len(flat), 2)]
     k = key.Key(flat=flat)
     for proto in range(pickle.HIGHEST_PROTOCOL + 1):
       s = pickle.dumps(k, protocol=proto)
@@ -220,13 +224,12 @@ class KeyTests(unittest.TestCase):
       self.assertEqual(k, kk)
 
   def testIncomplete(self):
-    k = key.Key(flat=['Kind', None])
+    key.Key(flat=['Kind', None])
     self.assertRaises(datastore_errors.BadArgumentError,
                       key.Key, flat=['Kind', None, 'Subkind', 1])
-    self.assertRaises(AssertionError, key.Key, flat=['Kind', ()])
+    self.assertRaises(TypeError, key.Key, flat=['Kind', ()])
 
   def testKindFromModel(self):
-    from . import model
     class M(model.Model):
       pass
     class N(model.Model):
@@ -241,6 +244,177 @@ class KeyTests(unittest.TestCase):
   def testKindFromBadValue(self):
     # TODO: BadArgumentError
     self.assertRaises(Exception, key.Key, 42, 42)
+
+  def testDeleteHooksCalled(self):
+    test = self # Closure for inside hook
+    self.pre_counter = 0
+    self.post_counter = 0
+
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_delete_hook(cls, key):
+        test.pre_counter += 1
+        if test.pre_counter == 1:  # Cannot test for key in delete_multi
+          self.assertEqual(self.key, key)
+      @classmethod
+      def _post_delete_hook(cls, key, future):
+        test.post_counter += 1
+        self.assertEqual(self.key, key)
+        self.assertTrue(future.get_result() is None)
+
+    furniture = HatStand()
+    key = furniture.put()
+    self.key = key
+    self.assertEqual(self.pre_counter, 0, 'Pre delete hook called early')
+    future = key.delete_async()
+    self.assertEqual(self.pre_counter, 1, 'Pre delete hook not called')
+    self.assertEqual(self.post_counter, 0, 'Post delete hook called early')
+    future.get_result()
+    self.assertEqual(self.post_counter, 1, 'Post delete hook not called')
+
+    # All counters now read 1, calling delete_multi for 10 keys makes this 11
+    new_furniture = [HatStand() for _ in range(10)]
+    keys = [furniture.put() for furniture in new_furniture]  # Sequential keys
+    multi_future = model.delete_multi_async(keys)
+    self.assertEqual(self.pre_counter, 11,
+                     'Pre delete hooks not called on delete_multi')
+    self.assertEqual(self.post_counter, 1,
+                     'Post delete hooks called early on delete_multi')
+    for fut, key in zip(multi_future, keys):
+      self.key = key
+      fut.get_result()
+    self.assertEqual(self.post_counter, 11,
+                     'Post delete hooks not called on delete_multi')
+
+  def testNoDefaultDeleteCallback(self):
+    # See issue 58.  http://goo.gl/hPN6j
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    class EmptyModel(model.Model):
+      pass
+    entity = EmptyModel()
+    entity.put()
+    fut = entity.key.delete_async()
+    self.assertFalse(fut._immediate_callbacks,
+                     'Delete hook queued default no-op.')
+
+  def testGetHooksCalled(self):
+    test = self # Closure for inside hook
+    self.pre_counter = 0
+    self.post_counter = 0
+
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_get_hook(cls, key):
+        test.pre_counter += 1
+        if test.pre_counter == 1:  # Cannot test for key in get_multi
+          self.assertEqual(key, self.key)
+      @classmethod
+      def _post_get_hook(cls, key, future):
+        test.post_counter += 1
+        self.assertEqual(key, self.key)
+        self.assertEqual(future.get_result(), self.entity)
+
+    furniture = HatStand()
+    self.entity = furniture
+    key = furniture.put()
+    self.key = key
+    self.assertEqual(self.pre_counter, 0, 'Pre get hook called early')
+    future = key.get_async()
+    self.assertEqual(self.pre_counter, 1, 'Pre get hook not called')
+    self.assertEqual(self.post_counter, 0, 'Post get hook called early')
+    future.get_result()
+    self.assertEqual(self.post_counter, 1, 'Post get hook not called')
+
+    # All counters now read 1, calling get for 10 keys should make this 11
+    new_furniture = [HatStand() for _ in range(10)]
+    keys = [furniture.put() for furniture in new_furniture]  # Sequential keys
+    multi_future = model.get_multi_async(keys)
+    self.assertEqual(self.pre_counter, 11,
+                     'Pre get hooks not called on get_multi')
+    self.assertEqual(self.post_counter, 1,
+                     'Post get hooks called early on get_multi')
+    for fut, key, entity in zip(multi_future, keys, new_furniture):
+      self.key = key
+      self.entity = entity
+      fut.get_result()
+    self.assertEqual(self.post_counter, 11,
+                     'Post get hooks not called on get_multi')
+
+  def testMonkeyPatchHooks(self):
+    hook_attr_names = ('_pre_get_hook', '_post_get_hook',
+                       '_pre_delete_hook', '_post_delete_hook')
+    original_hooks = {}
+
+    # Backup the original hooks
+    for name in hook_attr_names:
+      original_hooks[name] = getattr(model.Model, name)
+
+    self.pre_get_flag = False
+    self.post_get_flag = False
+    self.pre_delete_flag = False
+    self.post_delete_flag = False
+
+    # TODO: Should the unused arguments to Monkey Patched tests be tested?
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_get_hook(cls, unused_key):
+        self.pre_get_flag = True
+      @classmethod
+      def _post_get_hook(cls, unused_key, unused_future):
+        self.post_get_flag = True
+      @classmethod
+      def _pre_delete_hook(cls, unused_key):
+        self.pre_delete_flag = True
+      @classmethod
+      def _post_delete_hook(cls, unused_key, unused_future):
+        self.post_delete_flag = True
+
+    # Monkey patch the hooks
+    for name in hook_attr_names:
+      hook = getattr(HatStand, name)
+      setattr(model.Model, name, hook)
+
+    try:
+      key = HatStand().put()
+      key.get()
+      self.assertTrue(self.pre_get_flag,
+                      'Pre get hook not called when model is monkey patched')
+      self.assertTrue(self.post_get_flag,
+                      'Post get hook not called when model is monkey patched')
+      key.delete()
+      self.assertTrue(self.pre_delete_flag,
+                     'Pre delete hook not called when model is monkey patched')
+      self.assertTrue(self.post_delete_flag,
+                    'Post delete hook not called when model is monkey patched')
+    finally:
+      # Restore the original hooks
+      for name in hook_attr_names:
+        setattr(model.Model, name, original_hooks[name])
+
+  def testPreHooksCannotCancelRPC(self):
+    class Foo(model.Model):
+      @classmethod
+      def _pre_get_hook(cls, unused_key):
+        raise tasklets.Return()
+      @classmethod
+      def _pre_delete_hook(cls, unused_key):
+        raise tasklets.Return()
+    entity = Foo()
+    entity.put()
+    self.assertRaises(tasklets.Return, entity.key.get)
+    self.assertRaises(tasklets.Return, entity.key.delete)
+
+  def testNoDefaultGetCallback(self):
+    # See issue 58.  http://goo.gl/hPN6j
+    ctx = tasklets.get_context()
+    ctx.set_cache_policy(False)
+    class EmptyModel(model.Model):
+      pass
+    entity = EmptyModel()
+    entity.put()
+    fut = entity.key.get_async()
+    self.assertFalse(fut._immediate_callbacks, 'Get hook queued default no-op.')
 
 
 def main():
