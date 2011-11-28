@@ -7,6 +7,7 @@ import logging
 from google.appengine.api import channel
 
 import models
+import vhandler
 
 try:
   import json as simplejson
@@ -24,7 +25,12 @@ class BaseHandler(webapp2.RequestHandler):
     self.response.write(body)
 
   def render_jsonp(self, response):
-    self.response.write("%s(%s);" % (self.request.GET['callback'],
+    try:
+      cb = self.request.GET['callback']
+    except:
+      cb = ""
+    # self.response.write("%s(%s);" % (self.request.GET['callback'],
+    self.response.write("%s(%s);" % (cb,
                                      simplejson.dumps(response)))
 
 
@@ -34,6 +40,7 @@ class JoinGameHandler(BaseHandler):
     game = models.Hangout.get_current_game(hangout_id)
     plus_id = self.request.GET['plus_id']
     participant = models.Participant.get_participant(game, plus_id)
+    logging.info("created participant: %s", participant)
     response = {
       'channel_token': participant.channel_token,
     }
@@ -72,5 +79,6 @@ class SendMessageHandler(BaseHandler):
 
 application = webapp2.WSGIApplication([
     ('/api/join_game', JoinGameHandler),
+    ('/api/vote', vhandler.VoteHandler),
     ('/api/send_message', SendMessageHandler),
 ], debug=True)
