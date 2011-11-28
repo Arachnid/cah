@@ -8,7 +8,7 @@ from ndb import model
 import cards
 
 GAME_STATES = ['new', 'start_round', 'voting', 'scores']
-ROUNDS_PER_GAME = 5
+ROUNDS_PER_GAME = 5  # the count starts at 0
 
 class Hangout(model.Model):
   current_game = model.KeyProperty()
@@ -39,6 +39,7 @@ class Hangout(model.Model):
       return game
     return model.transaction(_tx)
 
+
   @classmethod
   def start_new_game(cls, hangout_id):
     """If there is a current game, set its end time.  Then create a new game 
@@ -49,7 +50,7 @@ class Hangout(model.Model):
     # game and get its list of participant's plus ids.  Create the new game and
     # its new particpant objects from the list of plus ids. 
     def _tx():
-      pid_list = []
+      
       hangout = cls.get_by_id(hangout_id)
       if not hangout:  # TODO - should this be an error instead?
         hangout = cls(id=hangout_id)
@@ -59,9 +60,10 @@ class Hangout(model.Model):
         # get the current active participants
         # TODO - do we need to set these to inactive?  don't think so,
         # since parent game will no longer be current.
-        old_participants = models.Participant.query(
-            models.Participant.playing == True,
-            ancestor=game.key).fetch()
+        old_participants = current_game.participants()
+        # old_participants = models.Participant.query(
+        #     models.Participant.playing == True,
+        #     ancestor=current_game.key).fetch()
       new_game = Game.new_game(hangout)
       new_game.put() # save now to generate key
       # associate new participant objects with new game
@@ -69,7 +71,7 @@ class Hangout(model.Model):
       # Participant class method below
       new_participants = []
       for p in old_participants:
-        newp = cls(id=p.plus_id, parent=new_game.key)
+        newp = Participant(id=p.plus_id, parent=new_game.key)
         newp.channel_id = str(newp.key)
         # need to keep the same channel token (unless push out the new one somehow)
         newp.channel_token = p.channel_token
@@ -112,6 +114,24 @@ class Game(model.Model):
         answer_deck=answer_deck
     )
 
+  def participants(self):
+    return Participant.query(
+        Participant.playing == True,
+        ancestor=self.key).fetch()
+
+  def start_new_round(self):
+    def _tx():
+      self.state = 'start_round'
+      random.shuffle(self.question_deck)
+      random.shuffle(self.answer_deck)
+      self.current_round += 1
+      # now reset the participants' votes to None.
+      participants = self.participants()
+      for p in participants:
+        p.vote = None
+      self.put()
+      model.put_multi(participants)
+    model.transaction(_tx)
 
 class Participant(model.Model):
   # Child entity of the Game in which they are participating
@@ -127,7 +147,7 @@ class Participant(model.Model):
   @property
   def plus_id(self):
     """The user's Google+ ID."""
-    return self.key.name()
+    return self.key.id()
 
   @classmethod
   def get_participant(cls, game_key, plus_id):
