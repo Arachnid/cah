@@ -7,7 +7,7 @@ import logging
 from google.appengine.api import channel
 
 import models
-import vhandler
+import statehandlers
 
 try:
   import json as simplejson
@@ -35,6 +35,8 @@ class JoinGameHandler(BaseHandler):
     game = models.Hangout.get_current_game(hangout_id)
     plus_id = self.request.GET['plus_id']
     participant = models.Participant.get_participant(game, plus_id)
+    game.deal_hand_for_p(participant.key) # in sep txn from method above, which
+        # should be okay
     logging.info("created participant: %s", participant)
     response = {
       'channel_token': participant.channel_token,
@@ -74,6 +76,7 @@ class SendMessageHandler(BaseHandler):
 
 application = webapp2.WSGIApplication([
     ('/api/join_game', JoinGameHandler),
-    ('/api/vote', vhandler.VoteHandler),
+    ('/api/vote', statehandlers.VoteHandler),
+    ('/api/select_card', statehandlers.SelectCardHandler),
     ('/api/send_message', SendMessageHandler),
 ], debug=True)
