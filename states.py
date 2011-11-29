@@ -122,6 +122,12 @@ class VotingGameState(GameState):
     # before all votes are in (which is okay)
     plus_id = kwargs['plus_id']
     pvid = kwargs['pvid']
+    if not plus_id or not pvid:
+      return {'status': 'ERROR', 
+              'message': 'Participant information not fully specified.'}
+    if plus_id == pvid:
+      return {'status': 'ERROR', 
+              'message': 'Participants cannot vote for themselves.'}
     def _tx():
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if not game:
