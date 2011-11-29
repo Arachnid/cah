@@ -1,4 +1,6 @@
+# Also change hostname_ in cah.js - bjm
 # application: google.com:aju-cah-test
+# application: brettmorgan-gwt-gadget-test
 application: cah-xhack
 version: 1
 runtime: python27
