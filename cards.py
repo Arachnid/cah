@@ -33,7 +33,7 @@ answers = [
   "An honest cop with nothing left to lose.",
   "Abstinence.",
   "A balanced breakfast.",
-  "Mountain Dw Code Red.",
+  "Mountain Dew Code Red.",
   "Concealing a boner.",
   "Roofies.",
   "Glenn Beck convulsively vomiting as a brood of crab spiders hatches in his brain and erupts from his tear ducts.",

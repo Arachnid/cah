@@ -23,6 +23,16 @@
  */
 
 /**
+ * Hostname of the server. So we can have test instances.
+ * @type {string}
+ * @private
+ */
+var hostname_ = "http://cah-xhack.appspot.com/";
+// var hostname_ = "http://aju-cah-test.googleplex.com/";
+// var hostname_ = "http://brettmorgan-gwt-gadget-test.appspot.com/";
+
+
+/**
  * Shared state of the app.
  * @type {Object.<!string, !string>}
  * @private
@@ -146,7 +156,7 @@ function getToken() {
   };
 
   $.ajax({
-    url: "http://cah-xhack.appspot.com/api/join_game",
+    url: hostname_ + "api/join_game",
     success: function (data) {
       openChannel(data.channel_token);
     },

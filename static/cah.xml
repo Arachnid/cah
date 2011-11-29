@@ -1,16 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Copyright 2011 Google Inc. All Rights Reserved -->
 <Module>
-  <ModulePrefs title="Yes/No/Maybe" height="100" width="550">
+  <ModulePrefs title="Cards Against Humanity" height="100" width="550">
   <Require feature="dynamic-height"/>
   <Require feature="rpc"/>
 </ModulePrefs>
 <Content type="html"><![CDATA[
   <!DOCTYPE html>
   <script type="text/javascript" src="//www.google.com/jsapi"></script>
-  <script type="text/javascript">google.load("jquery", "1.6.4");</script>
-  <script type="text/javascript"
-      src="//hangoutsapi.appspot.com/static/hangout.js"></script>
+  <script type="text/javascript">google.load("jquery", "1.7.0");</script>
+  <script type="text/javascript" src="//hangoutsapi.appspot.com/static/hangout.js"></script>
   <script type="text/javascript" src="/_ah/channel/jsapi"></script>
   <script type="text/javascript" src="//cah-xhack.appspot.com/static/cah.js"></script>
 
