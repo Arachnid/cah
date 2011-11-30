@@ -83,7 +83,7 @@ class Hangout(model.Model):
       new_participants.append(newp)
     model.put_multi(new_participants)
     new_game.select_new_question()
-    new_game.deal_cards() # to the new participants
+    new_game.deal_cards_all_p() # to the new participants
     hangout.current_game = new_game.key
     model.put_multi([hangout, current_game, new_game])
     return new_game

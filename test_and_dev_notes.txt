@@ -1,0 +1,70 @@
+
+This file serves as a place to store some useful URLs for backend testing, as well as a bit of a description on 
+expected behaviour. [We need to add unit tests as well, of course.]
+
+In the following URLs, the callback 'url' must be specified, but is not used/needed for non-xhr testing.
+
+
+initial setup-- have some participants join a hangout.  The first such call will include creation of a new game 
+associated with the hangout id.  As a participant joins, a 'hand' is dealt for them. 
+
+http://localhost:8080/api/join_game?hangout_id=123&plus_id=p111&callback=xyz
+http://localhost:8080/api/join_game?hangout_id=123&plus_id=p112&callback=xyz
+http://localhost:8080/api/join_game?hangout_id=123&plus_id=p113&callback=xyz
+
+ANSWER CARD SELECTION
+
+Starting from the above, to make card selection requests, first change the state of the created game in the admin 
+console from 'new' to 'start_round'.
+Then, for each participant, run a 'select_card' request as follows, where 'card_num' is set to one of the
+cards in the participant's 'cards' list.
+You will need to inspect the participant instance to see what cards they have.
+E.g. if participant p112 has card 17 in their list:
+
+http://localhost:8080/api/select_card?hangout_id=123&plus_id=p112&card_num=17&callback=xyz
+
+When a participant selects a card, it will be removed from their 'cards' list, and set as their 'selected_card'.
+
+When all participants have selected a card, the game state should change to from 'start_round' to 'voting'. This 
+will happen as part of the processing of the last such selection request.
+
+VOTING
+
+From the 'voting' state, a participant can vote (for another participant) like so.  'plus_id' is the id of the 
+user voting, and pvote is the plus_id of the participant they are voting for.  Participants can't vote for themselves.
+
+http://localhost:8080/api/vote?hangout_id=123&plus_id=p111&pvote=p112&callback=xyz
+http://localhost:8080/api/vote?hangout_id=123&plus_id=p113&pvote=p112&callback=xyz
+http://localhost:8080/api/vote?hangout_id=123&plus_id=p112&pvote=p113&callback=xyz
+
+After all particpants have voted, the game state should change from 'voting' to 'scores'.  The 'scores' processing 
+will take place as part of the processing of the last such vote request, which will not return until scores processing
+is done. [Note: if we want to, we can push the scores processing off to a task.]
+'scores' is an internal state not accessed directly by any request handler. Another way to phrase this is that while the 
+game is in the internal 'scores' state, request handlers that test for other states should just return.
+
+In the 'scores' state, [currently fake] scores for the round are calculated and sent via the channel api to the 
+participants.
+Then, one of two things happen:
+ - if there are still rounds to go in the game, the round count is updated, the game is set to 'start_round', and
+ a new round is set up (the participants' votes and selected cards are cleared, and a new question card for the round
+ is selected at random. [Note: score history is not yet managed.]
+ - if this was the last round for the game, create a new game and and set it as the current game for the hangout.
+ This process includes the creation of a new set of participant instances for the new game, based on the active 
+ participants in the old game. The new game starts out in the 'new' state.
+
+
+-----------------
+Current functionality gaps in the selection and voting handlers:
+
+ - currently, there's no check when voting to see if id matches existing participant entity for that game
+ - score calculation [need more definition on this?], manage score history
+ - no concept/handling of timeout or pausing
+ - no checking for min required number of participants in current game/round
+
+--------------------
+Questions:
+ - Scoring metrics/history...
+ - ...
+
+ 

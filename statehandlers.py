@@ -12,6 +12,7 @@ import states
 
 
 class VoteHandler(base.BaseHandler):
+  """..."""
 
   ACTION = 'vote'
       
@@ -45,16 +46,17 @@ class VoteHandler(base.BaseHandler):
     gs = states.GameStateFactory.get_game_state('voting', hangout_id)
     logging.info("about to attempt state transition")
     # make any valid transition
-    res = gs.attempt_transition(
-        None, action=self.ACTION, plus_id=plus_id, pvid=pvid)
-    logging.info("result of attempt_transition: %s", res)
+    res = gs.try_transition(
+        None, action=self.ACTION, plus_id=plus_id, pvid=pvid, handler=self)
+    logging.info("result of try_transition: %s", res)
     # now, see if we can do internal transition to 'scores'.
-    res = gs.attempt_transition('scores', plus_id=plus_id, pvid=pvid)
-    logging.info("result of attempt_transition: %s", res)
+    res = gs.try_transition('scores', plus_id=plus_id, pvid=pvid, handler=self)
+    logging.info("result of try_transition: %s", res)
     self.render_jsonp({'status': 'OK'})
 
 
 class SelectCardHandler(base.BaseHandler):
+  """..."""
 
   ACTION = 'select_card'
       
@@ -88,12 +90,14 @@ class SelectCardHandler(base.BaseHandler):
     gs = states.GameStateFactory.get_game_state('start_round', hangout_id)
     logging.info("about to attempt state transition")
     # make any valid transition
-    res = gs.attempt_transition(
-        None, action=self.ACTION, plus_id=plus_id, card_num=card_number)
-    logging.info("result of attempt_transition: %s", res)
+    res = gs.try_transition(
+        None, action=self.ACTION, plus_id=plus_id, card_num=card_number,
+        handler=self)
+    logging.info("result of try_transition: %s", res)
     # now, see if we can do internal transition to 'scores'.
-    res = gs.attempt_transition('voting', plus_id=plus_id, card_num=card_number)
-    logging.info("result of attempt_transition: %s", res)
+    res = gs.try_transition(
+        'voting', plus_id=plus_id, card_num=card_number, handler=self)
+    logging.info("result of try_transition: %s", res)
     self.render_jsonp({'status': 'OK'})
 
 
