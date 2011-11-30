@@ -51,7 +51,7 @@ Then, one of two things happen:
  is selected at random. [Note: score history is not yet managed.]
  - if this was the last round for the game, create a new game and and set it as the current game for the hangout.
  This process includes the creation of a new set of participant instances for the new game, based on the active 
- participants in the old game. The new game starts out in the 'new' state.
+ participants in the old game [see note below]. The new game starts out in the 'new' state.
 
 
 -----------------
@@ -61,10 +61,28 @@ Current functionality gaps in the selection and voting handlers:
  - score calculation [need more definition on this?], manage score history
  - no concept/handling of timeout or pausing
  - no checking for min required number of participants in current game/round
+ - similarly, need to add handling of max # of participants based on number of cards available.
+ - channel mgmt (see below)
 
 --------------------
-Questions:
+Questions/Issues:
+
+ - do we need to add retries to our transactions (in case of contention), or is this supported already by ndb?
+
+ - currently, as participants join, they're given a randomly selected hand from the remaining cards.  Is this model 
+ okay (rather than dealing out successive cards to all participants at once)? [Also, as noted above, need to make 
+ sure don't run out of cards before adding someone to a game.]
+ 
  - Scoring metrics/history...
- - ...
+
+ - Preserving channel token (and channel id) across participant instances: As discussed, we're creating a new set 
+ of child participants for each new game, based on the active participant info from the previous game. This  
+ could mean that we copy the channel token and id from old to new.
+ However, it may be problematic that the channel id is the id of an old participant instance.  For ex., this could
+ cause problems if the channel expires.
+ Instead, we might need to establish a new channel for each game ?
+
+
+
 
  

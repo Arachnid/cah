@@ -4,7 +4,6 @@ import logging
 import random
 
 from google.appengine.api import channel
-# from google.appengine.ext import deferred
 
 import models
 

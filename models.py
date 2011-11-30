@@ -70,21 +70,24 @@ class Hangout(model.Model):
       #     ancestor=current_game.key).fetch()
     new_game = Game.new_game(hangout)
     new_game.put() # save now to generate key
-    # associate new participant objects with new game
-    # todo - factor out this common functionality from the 
-    # Participant class method below
+    # associate new participant objects, using plus_id of the old obj,
+    # with the new game.
     new_participants = []
     for p in old_participants:
       newp = Participant(id=p.plus_id, parent=new_game.key)
-      newp.channel_id = str(newp.key)
-      # need to keep the same channel token (unless push out the new one somehow)
+      # hmm, should keep the same channel id and token,
+      # unless push out the new one somehow. This might be problematic 
+      # (channel id is based on participant key from original game).
+      newp.channel_id = p.channel_id
       newp.channel_token = p.channel_token
       newp.playing = True
       new_participants.append(newp)
-    model.put_multi(new_participants)
+    # model.put_multi(new_participants)
     new_game.select_new_question()
-    new_game.deal_cards_all_p() # to the new participants
+    # deal cards to the (copied-over) participants
+    new_game.deal_hands(new_participants)
     hangout.current_game = new_game.key
+    model.put_multi(new_participants)
     model.put_multi([hangout, current_game, new_game])
     return new_game
 
@@ -130,23 +133,15 @@ class Game(model.Model):
   # to get SIZE_OF_HAND of them.  If we don't throttle the number of
   # participants so that this is guaranteed, then we need to reduce the number
   # of cards per hand.
-  def deal_cards_all_p(self):
-    # deal from the answer deck
-    def _tx():
-      participants = self.participants()
-      for p in participants:
-        self.deal_hand(p)
-    model.transaction(_tx)
-
-  def deal_hand_for_p(self, pkey):
-    def _tx():
-      participant = pkey.get()
-      self.deal_hand(participant)
-    model.transaction(_tx)
+  # should be performed in context of txn
+  def deal_hands(self, participants):
+    for p in participants:
+      self.deal_hand(p)
 
 
   # the participant should not be already holding any cards. [Do we need to
   # check for and handle that case?]
+  # should be performed in context of txn
   def deal_hand(self, participant):
     deck_size = len(self.answer_deck)
     if deck_size < SIZE_OF_HAND:
@@ -213,10 +208,12 @@ class Participant(model.Model):
     return self.key.id()
 
   @classmethod
-  def get_participant(cls, game_key, plus_id):
-    if isinstance(game_key, Game):
-      game_key = game_key.key
+  def get_or_create_participant(cls, game_key, plus_id):
+    # require game key
+    # if isinstance(game_key, Game):
+      # game_key = game_key.key
     def _tx():
+      game = game_key.get()
       participant = cls.get_by_id(plus_id, parent=game_key)
       if not participant:
         participant = cls(id=plus_id, parent=game_key)
@@ -224,7 +221,10 @@ class Participant(model.Model):
         participant.channel_token = channel.create_channel(
             participant.channel_id)
       participant.playing = True
-      participant.put()
+      # deal the hand for the participant.
+      # TODO - check if enough cards etc. ?
+      game.deal_hand(participant)
+      model.put_multi([participant, game])
       return participant
     return model.transaction(_tx)
 
