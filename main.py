@@ -28,6 +28,22 @@ class BaseHandler(webapp2.RequestHandler):
     self.response.write("%s(%s);" % (self.request.GET['callback'],
                                      simplejson.dumps(response)))
 
+  def accumulate_response(self, dict):
+    """..."""
+    try:
+      if not hasattr(self, 'resp'):
+        self.resp = dict
+      else:
+        self.resp.update(dict)
+    except:
+      logging.info("bad dict data: %s", dict)
+
+
+  def render_jresp(self):
+    """..."""
+    if self.resp:
+      self.render_jsonp(self.resp)
+
 
 class JoinGameHandler(BaseHandler):
   def get(self):
@@ -111,14 +127,21 @@ class VoteHandler(BaseHandler):
       return
     gs = states.GameStateFactory.get_game_state('voting', hangout_id)
     logging.info("about to attempt state transition")
-    # make any valid transition
-    res = gs.try_transition(
+    # the 'None' arg indicates that it's okay to make any valid transition based
+    # on the given action ('vote')
+    res1 = gs.try_transition(
         None, action=self.ACTION, plus_id=plus_id, pvid=pvid, handler=self)
-    logging.info("result of try_transition: %s", res)
-    # now, see if we can do internal transition to 'scores'.
-    res = gs.try_transition('scores', plus_id=plus_id, pvid=pvid, handler=self)
-    logging.info("result of try_transition: %s", res)
-    self.render_jsonp({'status': 'OK'})
+    logging.info("result of try_transition on action %s: %s", self.ACTION, res1)
+    # now, see if we can do internal transition to 'scores'. (no action)
+    res2 = gs.try_transition('scores', plus_id=plus_id, pvid=pvid, handler=self)
+    logging.info("result of try_transition to 'scores': %s", res2)
+    if res1 == False or res2 == False:
+      # then there was some issue; don't set status to OK, just return
+      # what we have
+      self.render_jresp()
+    else:
+      self.accumulate_response({'status': 'OK'})
+      self.render_jresp()
 
 
 class SelectCardHandler(BaseHandler):
@@ -156,17 +179,23 @@ class SelectCardHandler(BaseHandler):
       return
     gs = states.GameStateFactory.get_game_state('start_round', hangout_id)
     logging.info("about to attempt state transition")
-    # make any valid transition
-    res = gs.try_transition(
+    # the 'None' arg indicates that it's okay to make any valid transition based
+    # on the given action ('select_card')
+    res1 = gs.try_transition(
         None, action=self.ACTION, plus_id=plus_id, card_num=card_number,
         handler=self)
-    logging.info("result of try_transition: %s", res)
-    # now, see if we can do internal transition to 'scores'.
-    res = gs.try_transition(
+    logging.info("result of try_transition with action %s: %s", self.ACTION, res1)
+    # now, see if we can do internal transition to 'voting'. (no action)
+    res2 = gs.try_transition(
         'voting', plus_id=plus_id, card_num=card_number, handler=self)
-    logging.info("result of try_transition: %s", res)
-    self.render_jsonp({'status': 'OK'})
-
+    logging.info("result of try_transition to 'voting': %s", res2)
+    if res1 == False or res2 == False:
+      # then there was some issue; don't set status to OK, just return
+      # what we have
+      self.render_jresp()
+    else:
+      self.accumulate_response({'status': 'OK'})
+      self.render_jresp()
 
 # -------------------------    
 

@@ -117,14 +117,14 @@ class VotingGameState(GameState):
       return False
     if plus_id == pvid:
       if handler:
-        handler.render_jsonp({'status': 'ERROR', 
+        handler.accumulate_response({'status': 'ERROR', 
               'message': 'Participants cannot vote for themselves.'})
       return False
     def _tx():
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if not game:
         if handler:
-          handler.render_jsonp({'status': 'ERROR', 
+          handler.accumulate_response({'status': 'ERROR', 
             'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
       else:
@@ -137,7 +137,7 @@ class VotingGameState(GameState):
         # all the players.
         if not game.state == 'voting':
           if handler:
-            handler.render_jsonp({'status' : 'ERROR', 
+            handler.accumulate_response({'status' : 'ERROR', 
                   'message': (
                       "Can't vote now, wrong game state %s." % (game.state,))})
           return False
@@ -145,7 +145,7 @@ class VotingGameState(GameState):
       participant = participant_key.get()
       if not participant:
         if handler:
-          handler.render_jsonp({'status': 'ERROR', 
+          handler.accumulate_response({'status': 'ERROR', 
            'message': "Could not retrieve indicated participant"})
         return False
       # TODO : also check that entity exists for this participant key?
@@ -166,7 +166,7 @@ class VotingGameState(GameState):
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if not game:
         if handler:
-          handler.render_jsonp({'status': 'ERROR', 
+          handler.accumulate_response({'status': 'ERROR', 
             'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
       if game.state != 'voting':
@@ -279,7 +279,7 @@ class StartRoundGameState(GameState):
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if not game:
         if handler:
-          handler.render_jsonp(
+          handler.accumulate_response(
               {'status': 'ERROR', 
                'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
@@ -297,13 +297,19 @@ class StartRoundGameState(GameState):
       participant = participant_key.get()
       if not participant:
         if handler:
-          handler.render_jsonp({'status': 'ERROR', 
+          handler.accumulate_response({'status': 'ERROR', 
            'message': "Could not retrieve indicated participant"})
         return False
       selected_card = kwargs['card_num']
-      participant.select_card(selected_card)
+      sres = participant.select_card(selected_card)
       participant.put()
-      return game
+      if not sres:
+        if handler:
+          handler.accumulate_response(
+              {'status': 'ERROR', 'message': "could not select card %s from hand" % (selected_card,)})
+        return False
+      else:
+        return game
     
     resp = model.transaction(_tx)  # run the transaction
     if not isinstance(resp, models.Game):
@@ -323,7 +329,7 @@ class StartRoundGameState(GameState):
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if not game:
         if handler:
-          handler.render_jsonp({'status': 'ERROR', 
+          handler.accumulate_response({'status': 'ERROR', 
             'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
       if game.state != 'start_round':

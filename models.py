@@ -235,10 +235,12 @@ class Participant(model.Model):
     if card_num in self.cards:
       self.cards.remove(card_num)
       self.selected_card = card_num
+      return card_num
     else:
       logging.warn(
           "selected card %s was not in participant's cards %s, %s",
           card_num, self.cards, self.plus_id)
+      return False
 
 
 

@@ -1,12 +1,20 @@
 
-This file serves as a place to store some useful URLs for backend testing, as well as a bit of a description on 
-expected behaviour. [We need to add unit tests as well, of course.]
+
+This file serves as a place to store design notes and issues, and some useful URLs for backend testing, as well as a
+bit of a description on expected behaviour. 
+I'm experimenting with factoring state transition knowledge from the handlers (see states.py); this is a work in
+progress still. See notes at bottom of this doc.
+
+
+------------------------
+Some example request URLs:
 
 In the following URLs, the callback 'url' must be specified, but is not used/needed for non-xhr testing.
 
+INITIAL GAME SETUP
 
-initial setup-- have some participants join a hangout.  The first such call will include creation of a new game 
-associated with the hangout id.  As a participant joins, a 'hand' is dealt for them. 
+Initial setup-- have some participants join a hangout.  The call will create the hangout and game 
+as necessary.  As a participant joins, a 'hand' is dealt for them. 
 
 http://localhost:8080/api/join_game?hangout_id=123&plus_id=p111&callback=xyz
 http://localhost:8080/api/join_game?hangout_id=123&plus_id=p112&callback=xyz
@@ -55,6 +63,11 @@ Then, one of two things happen:
 
 
 -----------------
+Known current bugs:
+
+ - ...
+
+-----------------
 Current functionality gaps in the selection and voting handlers:
 
  - currently, there's no check when voting to see if id matches existing participant entity for that game
@@ -63,11 +76,17 @@ Current functionality gaps in the selection and voting handlers:
  - no checking for min required number of participants in current game/round
  - similarly, need to add handling of max # of participants based on number of cards available.
  - channel mgmt (see below)
+ - no unit tests yet
 
 --------------------
-Questions/Issues:
+Questions/Issues/Design Notes:
 
- - do we need to add retries to our transactions (in case of contention), or is this supported already by ndb?
+ - As noted above, the 'GameState' design (see states.py), with state transition knowledge factored from the
+handlers, is kind of a work in progress and would no doubt benefit from discussion.
+
+ - As we discussed, it probably makes sense to create a 'handlers' module and pull them out of main.
+
+ - to check: do we need to add retries to our transactions (in case of contention), or is this supported already by ndb?
 
  - currently, as participants join, they're given a randomly selected hand from the remaining cards.  Is this model 
  okay (rather than dealing out successive cards to all participants at once)? [Also, as noted above, need to make 
@@ -82,7 +101,3 @@ Questions/Issues:
  cause problems if the channel expires.
  Instead, we might need to establish a new channel for each game ?
 
-
-
-
- 
