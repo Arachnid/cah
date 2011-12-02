@@ -7,6 +7,13 @@ from google.appengine.api import channel
 
 import models
 
+try:
+  import json as simplejson
+except ImportError:
+  from django.utils import simplejson
+
+# logging.getLogger().setLevel(logging.DEBUG)
+
 
 class GameState():
 
@@ -108,7 +115,7 @@ class VotingGameState(GameState):
     # before all votes are in (which is okay)
     plus_id = kwargs['plus_id']
     pvid = kwargs['pvid']
-    logging.info("in _transit_to_voting, with plus id %s and pvid %s",
+    logging.debug("in _transit_to_voting, with plus id %s and pvid %s",
         plus_id, pvid)
     if not plus_id or not pvid:
       if handler:
@@ -128,7 +135,7 @@ class VotingGameState(GameState):
             'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
       else:
-        logging.info("using game: %s", game)
+        logging.debug("using game: %s", game)
         # check game state.
         # players can only vote from the 'voting' state.
         # This state is transitioned to from the 'start_round' state once 
@@ -159,7 +166,7 @@ class VotingGameState(GameState):
 
   def _transit_to_scores(self, **kwargs):
     """..."""
-    logging.info("in _transit_to_scores")
+    logging.debug("in _transit_to_scores")
     handler = kwargs['handler']
     
     def _tx(): # put the state change in a transaction
@@ -215,11 +222,11 @@ class VotingGameState(GameState):
     self._send_scores(participants)
 
   def _send_scores(self, participants):
-    # tbd
+    # TODO - actual scores
     for participant in participants:
       message = ("particpant %s got score %s" 
                  % (participant.key, participant.score))
-      logging.info("score message to %s: %s" % (participant, message))
+      logging.debug("score message to %s: %s" % (participant, message))
       channel.send_message(
           participant.channel_id, message)
 
@@ -260,7 +267,7 @@ class StartRoundGameState(GameState):
       models.Participant.playing == True,
       models.Participant.selected_card == None,
       ancestor=game_key).fetch()
-    logging.info("participants who have not selected a card: %s", participants)
+    logging.debug("participants who have not selected a card: %s", participants)
     if participants:
       return False
     else:
@@ -284,7 +291,7 @@ class StartRoundGameState(GameState):
                'message' : "Game for hangout %s not found" % (self.hangout_id,)})
         return False
       else:
-        logging.info("using game: %s", game)
+        logging.debug("using game: %s", game)
         # check game state.
         # players can only select a card from the 'start_round' state.
         if not game.state == 'start_round':
@@ -309,20 +316,17 @@ class StartRoundGameState(GameState):
               {'status': 'ERROR', 'message': "could not select card %s from hand" % (selected_card,)})
         return False
       else:
-        return game
+        return selected_card
     
-    resp = model.transaction(_tx)  # run the transaction
-    if not isinstance(resp, models.Game):
-      # then error
-      pass
-    else:
-      # okay
-      logging.info("in _transit_to_start_round, successfully updated info")
-      pass
-    return resp
+    res = model.transaction(_tx)  # run the transaction
+    if res: #broadcast successful selection
+      game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
+      message = {'selected_card': res, 'player': plus_id}
+      game.message_all_participants(simplejson.dumps(message))
+    return res
 
   def _transit_to_voting(self, **kwargs):
-    logging.info("in _transit_to_voting")
+    logging.debug("in _transit_to_voting")
     handler = kwargs['handler']
     
     def _tx(): # make the state change in a transaction

@@ -70,6 +70,7 @@ Known current bugs:
 -----------------
 Current functionality gaps in the selection and voting handlers:
 
+ 
  - currently, there's no check when voting to see if id matches existing participant entity for that game
  - score calculation [need more definition on this?], manage score history
  - no concept/handling of timeout or pausing

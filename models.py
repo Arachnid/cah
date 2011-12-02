@@ -2,6 +2,8 @@ import random
 import datetime
 import logging
 
+# logging.getLogger().setLevel(logging.DEBUG)
+
 from google.appengine.api import channel
 from ndb import model
 
@@ -129,6 +131,12 @@ class Game(model.Model):
         Participant.playing == True,
         ancestor=self.key).fetch()
 
+  def message_all_participants(self, message):
+    logging.debug("in message_all_participants with msg: %s", message)
+    for participant in self.participants():
+      logging.debug("sending msg to %s", participant.plus_id)
+      channel.send_message(participant.channel_id, message)
+
   # TODO: for now, assume that we have enough answer cards for all participants
   # to get SIZE_OF_HAND of them.  If we don't throttle the number of
   # participants so that this is guaranteed, then we need to reduce the number
@@ -155,13 +163,13 @@ class Game(model.Model):
       del(self.answer_deck[idx])
       deck_size -= 1
     model.put_multi([participant, self])
-    logging.info(
+    logging.debug(
         "participant %s got hand %s", participant.plus_id, participant.cards)
-    logging.info("answer deck is now: %s", self.answer_deck)
+    logging.debug("answer deck is now: %s", self.answer_deck)
 
 
   def select_new_question(self):
-    logging.info(
+    logging.debug(
         "in select_new_question with starting qdeck: %s", self.question_deck)
     # select at random from the question deck
     qnum = random.randint(0, len(self.question_deck)-1)
@@ -232,6 +240,11 @@ class Participant(model.Model):
   # tbd.  Select a card from the participant's hand
   # card_num is the card number, not the card's index in the list.
   def select_card(self, card_num):
+    if self.selected_card: # if card already selected
+      logging.warn(
+          "Participant %s has already selected card %s", 
+          self.plus_id, self.selected_card)
+      return False
     if card_num in self.cards:
       self.cards.remove(card_num)
       self.selected_card = card_num

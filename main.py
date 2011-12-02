@@ -4,6 +4,8 @@ from webapp2_extras import jinja2
 from ndb import model
 import logging
 
+# logging.getLogger().setLevel(logging.DEBUG)
+
 from google.appengine.api import channel
 
 import models
@@ -55,7 +57,14 @@ class JoinGameHandler(BaseHandler):
     participant = models.Participant.get_or_create_participant(
         game.key, plus_id)
     logging.info("created participant: %s", participant)
+    # TODO - does it make sense to return their cards list here as part of the
+    # response, or should the info be pushed out separately, via their channel?
+    # For bookkeeping, does any other info need to be returned along with the
+    # cards?  Currently returning game id also, but not sure that this is
+    # necessary.
     response = {
+      'cards': participant.cards,
+      'game_id': game.key.id(),
       'channel_token': participant.channel_token,
     }
     self.render_jsonp(response)
@@ -198,7 +207,6 @@ class SelectCardHandler(BaseHandler):
       self.render_jresp()
 
 # -------------------------    
-
 
 application = webapp2.WSGIApplication([
     ('/api/join_game', JoinGameHandler),
