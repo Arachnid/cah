@@ -3,8 +3,10 @@
 This file serves as a place to store design notes and issues, and some useful URLs for backend testing, as well as a
 bit of a description of expected behaviour. 
 
-So far, I've worked on implementing the card selection and voting part of the process, and also modified the 'join' 
-actions to include dealing out a hand to the player joining.
+So far, I've worked on implementing the card selection and voting/scoring part of the process, and in the process 
+modified game & round setup to support selecting a question card, and the 'join' actions to 
+include dealing out a hand to the player joining.  
+
 The notes below comment on some of the things that still need to be done. (not an exhaustive list.)
 
 I'm experimenting with factoring state transition knowledge from the handler classes (see states.py); this is something
