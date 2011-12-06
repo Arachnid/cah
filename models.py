@@ -190,11 +190,13 @@ class Game(model.Model):
     # select a new question card for the round
     self.select_new_question()
     self.current_round += 1
-    # now reset the participants' votes and card selections to None.
+    # now reset the participants' votes, card selections, and round score.
+    # Don't reset the overall game score.
     participants = self.participants()
     for p in participants:
       p.vote = None
       p.selected_card = None
+      p.score = 0
     self.put()
     model.put_multi(participants)
 
@@ -206,6 +208,7 @@ class Participant(model.Model):
   channel_token = model.StringProperty(indexed=False)
   playing = model.BooleanProperty(default=True)
   score = model.IntegerProperty(default=0)
+  game_score = model.IntegerProperty(default=0)
   cards = model.IntegerProperty(repeated=True)
   selected_card = model.IntegerProperty()
   vote = model.KeyProperty()

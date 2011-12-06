@@ -65,18 +65,26 @@ Then, one of two things happen:
 -----------------
 Known current bugs:
 
- - ...
+ - Currently, every player is dealt N cards when they join (without any checks).  In addition to checking # of cards 
+   left, players who join a game after it has started should probably be dealt only cards for the # of rounds left (?).
+ - Similarly, need to add handling of max # of participants based on number of cards available.
 
 -----------------
 Current functionality gaps in the selection and voting handlers:
 
  
- - currently, there's no check when voting to see if id matches existing participant entity for that game
- - score calculation [need more definition on this?], manage score history
+ - currently, there's no check when voting to see if the indicated id matches an existing participant entity for 
+   that game.
+ 
+ - Score calculation may be too simplistic. Current approach:
+   - per round, simply count the number of votes the person received
+   - accumulate votes over the rounds of a given game.
+   - Reset the game score to zero with a new game, but the old games remain in the datastore in case we want to
+     do any larger aggregate calculations for all games associated with a given hangout id.
+   
  - no concept/handling of timeout or pausing
  - no checking for min required number of participants in current game/round
- - similarly, need to add handling of max # of participants based on number of cards available.
- - channel mgmt (see below)
+  - channel mgmt (see below)
  - no unit tests yet
 
 --------------------
