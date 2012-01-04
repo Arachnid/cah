@@ -157,6 +157,17 @@ class SelectCardHandler(BaseHandler):
   """..."""
 
   ACTION = 'select_card'
+
+  # TODO - should probably send list rather than multiple messages
+  # TODO: should the broadcasting part be part of the handler logic or the state transition logic?
+  def _broadcast_selected_cards(self, participants):
+    for participant in participants:
+      message = ("particpant %s selected card %s" 
+                 % (participant.key.id(), participant.selected_card))
+      for p in participants:
+        logging.info("selection message to %s: %s" % (p.key, message))
+        channel.send_message(
+            p.channel_id, message)  
       
   def get(self):
 
@@ -190,20 +201,23 @@ class SelectCardHandler(BaseHandler):
     logging.info("about to attempt state transition")
     # the 'None' arg indicates that it's okay to make any valid transition based
     # on the given action ('select_card')
-    res1 = gs.try_transition(
+    selected_p = gs.try_transition(
         None, action=self.ACTION, plus_id=plus_id, card_num=card_number,
         handler=self)
-    logging.info("result of try_transition with action %s: %s", self.ACTION, res1)
+    logging.info("result of try_transition with action %s: %s", self.ACTION, selected_p)
     # now, see if we can do internal transition to 'voting'. (no action)
-    res2 = gs.try_transition(
+    voting_p = gs.try_transition(
         'voting', plus_id=plus_id, card_num=card_number, handler=self)
-    logging.info("result of try_transition to 'voting': %s", res2)
-    if res1 == False or res2 == False:
+    logging.info("result of try_transition to 'voting': %s", voting_p)
+
+    if selected_p == False or voting_p == False:
       # then there was some issue; don't set status to OK, just return
       # what we have
       self.render_jresp()
     else:
-      self.accumulate_response({'status': 'OK'})
+      if voting_p:  #transition to voting successful
+        self._broadcast_selected_cards(game.participants())      
+      self.accumulate_response({'status': 'OK', 'message': card_number})
       self.render_jresp()
 
 # -------------------------    

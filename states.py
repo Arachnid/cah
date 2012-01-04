@@ -58,8 +58,8 @@ class GameState():
 
   def try_transition(self, next_state, **kwargs):
     """Transition (if conditions are met) to the given next_state if next state
-    arg is set;  otherwise to the first next_state whose transition conditions are
-    met.
+    arg is set;  otherwise (no specific next_state indicated) 
+    to a next state whose transition conditions are met.
     """
     res = None
     if next_state: # if state specified, try to transit to it
@@ -90,7 +90,7 @@ class GameStateFactory():
 # ----------------------------------------
 
 class VotingGameState(GameState):
-  """Encodes information about the 'voting' state
+  """Encodes information about the 'voting' state.  
   """
 
   def __init__(self, hangout_id):
@@ -102,15 +102,16 @@ class VotingGameState(GameState):
     """Encodes transition conditions for the 'voting' state to the given next
     state.
     If the next state is 'voting', and the 'action' argument is 'vote', then it 
-    is always okay to transition. (a user can vote more than once).
+    is always okay to transition. (a user can vote more than once as long
+    as the game is still in the 'voting' state; the last vote is retained).
     If the next state is 'scores', then transition conditions are met if all
     participants have voted.
     """
     game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
     if next_state == 'voting':
       return kwargs['action']  == 'vote'
-    elif next_state == 'scores': # this internal state change will be
-        # explicitly requested
+    elif next_state == 'scores': # okay to transition if all participants
+        # have voted
       return self.all_votesp(game.key)
     else:
       return False    
@@ -127,8 +128,7 @@ class VotingGameState(GameState):
   
   def all_votesp(self, game_key):
     """returns a boolean, indicating whether all active game participants have
-    registered a vote (implicitly, for this round-- vote info gets reset at
-    the end of each round).
+    registered a vote. (vote info gets reset at the end of each round).
     """
     participants = models.Participant.query(
       models.Participant.playing == True,
@@ -141,8 +141,9 @@ class VotingGameState(GameState):
       return True
   
 
-  # performed on the 'vote' action, as indicated above. 
-  # (make this relationship more explicit?)
+  # performed if the action is 'vote', as indicated above in 
+  # _check_transit_conds
+  # (make this more explicit?)
   def _transit_to_voting(self, **kwargs):
     """Transition from the 'voting' state to itself (via the 'vote' action).
     """
@@ -201,6 +202,9 @@ class VotingGameState(GameState):
     resp = model.transaction(_tx)  # run the transaction
     return resp
 
+  # performed if all participants have voted, as indicated above in
+  # _check_transit_conds
+  # (make this more explicit?)
   def _transit_to_scores(self, **kwargs):
     """Transition from the 'voting' state to the 'scores' state.
     """
@@ -224,7 +228,9 @@ class VotingGameState(GameState):
       # TODO: currently, the scores for this round are only recorded briefly,
       # as the transaction below will reset them as part of the setup for the 
       # next round/game.  Might want to change this.
-      self._send_scores(participants)
+      # TODO: should the broadcasting part be part of the handler logic or 
+      # the state transition logic?
+      self._broadcast_scores(participants)
       return True
     model.transaction(_tx)
     # We can now start a new round.  If we've had N rounds, this is a new 
@@ -232,6 +238,7 @@ class VotingGameState(GameState):
     def _tx2():
       game = models.Hangout.get_by_id(self.hangout_id).current_game.get()
       if game.current_round >= models.ROUNDS_PER_GAME:
+        # if have reached the limit of rounds for a game,
         # then start new game using the participants of the current game
         return (game, self.start_new_game())
       else:
@@ -281,13 +288,17 @@ class VotingGameState(GameState):
     logging.info("in _build_votes_dict, got pvotes: %s", pvotes)
     return pvotes
 
-  def _send_scores(self, participants):
+  # TODO: should probably send list rather than multiple messages
+  # TODO: should the broadcasting part be part of the handler logic or the
+  # state transition logic?
+  def _broadcast_scores(self, participants):
     for participant in participants:
       message = ("particpant %s got score %s" 
-                 % (participant.key, participant.score))
-      logging.debug("score message to %s: %s" % (participant, message))
-      channel.send_message(
-          participant.channel_id, message)
+                 % (participant.key.id(), participant.score))
+      for p in participants:
+        logging.info("score message to %s: %s" % (p.key, message))
+        channel.send_message(
+            p.channel_id, message)
 
 
 # ----------------------------------------
@@ -332,8 +343,12 @@ class StartRoundGameState(GameState):
     else:
       return True
   
-  # encodes the 'answer card selection' action.  Need to make this explicit.
+  # performed if the action is 'select_card', as indicated in 
+  # _check_transit_conds
+  # (make this more explicit?)
   def _transit_to_start_round(self, **kwargs):
+    """From the start_round state, transition to the start_round state.
+    """
     logging.info("in _transit_to_start_round")
     handler = kwargs['handler']
     
@@ -372,7 +387,8 @@ class StartRoundGameState(GameState):
       if not sres:
         if handler:
           handler.accumulate_response(
-              {'status': 'ERROR', 'message': "could not select card %s from hand" % (selected_card,)})
+              {'status': 'ERROR', 
+               'message': "could not select card %s from hand" % (selected_card,)})
         return False
       else:
         return selected_card
@@ -384,7 +400,12 @@ class StartRoundGameState(GameState):
       game.message_all_participants(simplejson.dumps(message))
     return res
 
+  # performed if all participants have selected a card, as indicated in 
+  # _check_transit_conds
+  # (make this more explicit?)
   def _transit_to_voting(self, **kwargs):
+    """From the start_round state, transition to the voting state.
+    """      
     logging.debug("in _transit_to_voting")
     handler = kwargs['handler']
     

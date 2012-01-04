@@ -57,8 +57,8 @@ is done. [Note: if we want to, we can push the scores processing off to a task.]
 'scores' is an internal state not accessed directly by any request handler. Another way to phrase this is that while the 
 game is in the internal 'scores' state, request handlers that test for other states should just return.
 
-In the 'scores' state, [currently fake] scores for the round are calculated and sent via the channel api to the 
-participants.
+In the 'scores' state, scores for the round are calculated and sent via the channel api to the 
+participants. The current score calculation is probably too simplistic.
 Then, one of two things happen:
  - if there are still rounds to go in the game, the round count is updated, the game is set to 'start_round', and
  a new round is set up (the participants' votes and selected cards are cleared, and a new question card for the round

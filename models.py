@@ -149,8 +149,12 @@ class Game(model.Model):
 
   # the participant should not be already holding any cards. [Do we need to
   # check for and handle that case?]
-  # should be performed in context of txn
+  # TODO: actually, since the deck is already shuffled, don't really need to
+  # select randomly from it, though it shouldn't hurt anything.
+  # should be performed in context of txn.
   def deal_hand(self, participant):
+    """ Deal a (randomly selected) hand from the game's answer deck.
+    """
     deck_size = len(self.answer_deck)
     if deck_size < SIZE_OF_HAND:
       logging.warn("not enough cards")
@@ -168,7 +172,11 @@ class Game(model.Model):
     logging.debug("answer deck is now: %s", self.answer_deck)
 
 
+  # TODO: actually, since the deck is already shuffled, don't really need to
+  # select randomly from it, though it shouldn't hurt anything.
   def select_new_question(self):
+    """ select a question card (randomly) from the game's question deck
+    """
     logging.debug(
         "in select_new_question with starting qdeck: %s", self.question_deck)
     # select at random from the question deck
@@ -184,9 +192,16 @@ class Game(model.Model):
   
   # note: not in its own txn, but is called in the context of a txn.
   def start_new_round(self):
+    """ start a new round of the given game.
+    """
+    # first check that we have not maxed out the number of rounds for this
+    # game.
+    # The calling method 'should' have checked this already.
+    if self.current_round >= ROUNDS_PER_GAME:
+      # TODO - assuming it makes sense to have this be an exception, should
+      # define a 'GameException' subclass or similar.
+      raise Exception("Have reached last round in game; can't start new one.")
     self.state = 'start_round'
-    # random.shuffle(self.question_deck)
-    # random.shuffle(self.answer_deck)
     # select a new question card for the round
     self.select_new_question()
     self.current_round += 1
@@ -240,9 +255,10 @@ class Participant(model.Model):
     return model.transaction(_tx)
 
 
-  # tbd.  Select a card from the participant's hand
   # card_num is the card number, not the card's index in the list.
   def select_card(self, card_num):
+    """ select a card from the participant's hand.
+    """
     if self.selected_card: # if card already selected
       logging.warn(
           "Participant %s has already selected card %s", 
