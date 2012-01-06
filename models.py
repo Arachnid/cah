@@ -2,8 +2,6 @@ import random
 import datetime
 import logging
 
-# logging.getLogger().setLevel(logging.DEBUG)
-
 from google.appengine.api import channel
 from ndb import model
 
@@ -11,12 +9,16 @@ import cards
 
 GAME_STATES = ['new', 'start_round', 'voting', 'scores']
 ROUNDS_PER_GAME = 5  # the count starts at 0
-SIZE_OF_HAND = 5 # the number of cards dealt to each participant per game
+SIZE_OF_HAND = 5  # the number of cards dealt to each participant per game
 
 
 class Hangout(model.Model):
+  """ Encodes information about a hangout and its child games, one of which
+  is the current game.
+  """
+
   current_game = model.KeyProperty()
-  
+
   @property
   def hangout_id(self):
     return self.key.name()
@@ -24,6 +26,7 @@ class Hangout(model.Model):
   @classmethod
   def get_current_game(cls, hangout_id):
     """Retrieves the current game, or creates one if none exists."""
+
     def _tx():
       dirty = False
       hangout = cls.get_by_id(hangout_id)
@@ -42,34 +45,27 @@ class Hangout(model.Model):
       return game
     return model.transaction(_tx)
 
-
-  # note: doesn't wrap the actions in its own txn, but should be performed in
-  # the context of a txn.
   @classmethod
-  def start_new_game(cls, hangout_id):
-    """If there is a current game, set its end time.  Then create a new game 
-    as the current hangout game, using the participant list of the current game.
-    Returns the new game.
+  def start_new_game(cls, hangout_id, old_participants):
+    """If there is a current game, set its end time.  Then create a new game
+    as the current hangout game, using the given participant list (of the
+    current game). Returns the new game.
     """
     # set the end date of the current
     # game and get its list of participant's plus ids.  Create the new game and
-    # its new participant objects from the list of plus ids. 
+    # its new participant objects from the list of plus ids.
 
-    # def _tx():
-      
     hangout = cls.get_by_id(hangout_id)
-    if not hangout:  # TODO - should this be an error instead?
+    if not hangout:  # TODO: should this be an error instead?
       hangout = cls(id=hangout_id)
     if hangout.current_game:
       current_game = hangout.current_game.get()
       current_game.end_time = datetime.datetime.now()
       # get the current active participants
-      # TODO - do we need to set these to inactive?  don't think so,
-      # since parent game will no longer be current.
-      old_participants = current_game.participants()
-      # old_participants = models.Participant.query(
-      #     models.Participant.playing == True,
-      #     ancestor=current_game.key).fetch()
+      # TODO: do we need to set these to inactive?  don't think so,
+      # since parent game will no longer be current, and we retrieve by parent
+      # game.
+      # old_participants = current_game.participants()
     new_game = Game.new_game(hangout)
     new_game.put() # save now to generate key
     # associate new participant objects, using plus_id of the old obj,
@@ -78,13 +74,13 @@ class Hangout(model.Model):
     for p in old_participants:
       newp = Participant(id=p.plus_id, parent=new_game.key)
       # hmm, should keep the same channel id and token,
-      # unless push out the new one somehow. This might be problematic 
+      # unless push out the new one somehow. This might be problematic
       # (channel id is based on participant key from original game).
       newp.channel_id = p.channel_id
       newp.channel_token = p.channel_token
+      newp.hangout_score = p.hangout_score
       newp.playing = True
       new_participants.append(newp)
-    # model.put_multi(new_participants)
     new_game.select_new_question()
     # deal cards to the (copied-over) participants
     new_game.deal_hands(new_participants)
@@ -93,12 +89,12 @@ class Hangout(model.Model):
     model.put_multi([hangout, current_game, new_game])
     return new_game
 
-    # return model.transaction(_tx)
-    
-
 
 class Game(model.Model):
-  # Child entity of the hangout this game is in
+  """ Encode information about a hangout game.  Participants are child entities
+  of their game.
+  Games are child entities of their hangout.
+  """
 
   state = model.StringProperty(choices=GAME_STATES, default='new')
   question_deck = model.IntegerProperty(repeated=True)
@@ -112,6 +108,10 @@ class Game(model.Model):
 
   @classmethod
   def new_game(cls, hangout):
+    """ Create a new game. This includes setting up a new shuffled question and
+    answer deck.  The answer cards are 'dealt' as participant hands when the
+    participants join.
+    """
     question_deck = range(len(cards.questions))
     random.shuffle(question_deck)
     logging.info("question deck: %s", question_deck)
@@ -121,7 +121,7 @@ class Game(model.Model):
     return cls(
         parent=hangout.key,
         state='new',
-        current_round = 0,
+        current_round=0,
         question_deck=question_deck,
         answer_deck=answer_deck
     )
@@ -132,50 +132,46 @@ class Game(model.Model):
         ancestor=self.key).fetch()
 
   def message_all_participants(self, message):
-    logging.debug("in message_all_participants with msg: %s", message)
+    logging.info("in message_all_participants with msg: %s", message)
     for participant in self.participants():
-      logging.debug("sending msg to %s", participant.plus_id)
+      logging.info("sending channel msg to %s", participant.plus_id)
       channel.send_message(participant.channel_id, message)
 
-  # TODO: for now, assume that we have enough answer cards for all participants
-  # to get SIZE_OF_HAND of them.  If we don't throttle the number of
-  # participants so that this is guaranteed, then we need to reduce the number
-  # of cards per hand.
-  # should be performed in context of txn
+  # TODO: for now, are basically assuming that we have enough answer cards
+  # for all participants to get SIZE_OF_HAND of them.  Currently, if this is
+  # not true, the latter participants just don't get cards.
   def deal_hands(self, participants):
     for p in participants:
       self.deal_hand(p)
 
-
-  # the participant should not be already holding any cards. [Do we need to
-  # check for and handle that case?]
-  # TODO: actually, since the deck is already shuffled, don't really need to
-  # select randomly from it, though it shouldn't hurt anything.
-  # should be performed in context of txn.
+  # TODO: the participant 'should' not be already holding any cards. Should
+  # probably check for that.
   def deal_hand(self, participant):
     """ Deal a (randomly selected) hand from the game's answer deck.
     """
     deck_size = len(self.answer_deck)
     if deck_size < SIZE_OF_HAND:
       logging.warn("not enough cards")
-      return
+      return None
     participant.cards = []
-    for i in range(0,SIZE_OF_HAND):
+    for _ in range(0, SIZE_OF_HAND):
+      # note: since the deck is already shuffled, probably don't really need to
+      # select randomly from it...
       idx = random.randint(0, deck_size-1)
       card = self.answer_deck[idx]
       participant.cards.append(card)
-      del(self.answer_deck[idx])
+      del self.answer_deck[idx]
       deck_size -= 1
     model.put_multi([participant, self])
     logging.debug(
         "participant %s got hand %s", participant.plus_id, participant.cards)
     logging.debug("answer deck is now: %s", self.answer_deck)
-
+    return participant.cards
 
   # TODO: actually, since the deck is already shuffled, don't really need to
   # select randomly from it, though it shouldn't hurt anything.
   def select_new_question(self):
-    """ select a question card (randomly) from the game's question deck
+    """ select a question card (randomly) from the game's question deck.
     """
     logging.debug(
         "in select_new_question with starting qdeck: %s", self.question_deck)
@@ -183,15 +179,14 @@ class Game(model.Model):
     qnum = random.randint(0, len(self.question_deck)-1)
     self.current_question = self.question_deck[qnum]
     # remove selected from the deck
-    del(self.question_deck[qnum])
+    del self.question_deck[qnum]
     logging.info(
-        "current question %s and new deck %s", 
+        "current question %s and new deck %s",
         self.current_question, self.question_deck)
     self.put()
 
-  
   # note: not in its own txn, but is called in the context of a txn.
-  def start_new_round(self):
+  def start_new_round(self, participants):
     """ start a new round of the given game.
     """
     # first check that we have not maxed out the number of rounds for this
@@ -207,7 +202,7 @@ class Game(model.Model):
     self.current_round += 1
     # now reset the participants' votes, card selections, and round score.
     # Don't reset the overall game score.
-    participants = self.participants()
+    # participants = self.participants()
     for p in participants:
       p.vote = None
       p.selected_card = None
@@ -217,13 +212,18 @@ class Game(model.Model):
 
 
 class Participant(model.Model):
-  # Child entity of the Game in which they are participating
-  
+  """..."""
+  # Child entity of the Game in which it is participating
+
   channel_id = model.StringProperty(indexed=False)
   channel_token = model.StringProperty(indexed=False)
   playing = model.BooleanProperty(default=True)
-  score = model.IntegerProperty(default=0)
-  game_score = model.IntegerProperty(default=0)
+  score = model.IntegerProperty(default=0) #score for round
+  game_score = model.IntegerProperty(default=0) #score for game; not preserved
+      # across games.
+  # TODO - this total score is simply accumulated for the whole hangout,
+  # not taking into account leave/join events.  Might want different logic.
+  hangout_score = model.IntegerProperty(default=0)
   cards = model.IntegerProperty(repeated=True)
   selected_card = model.IntegerProperty()
   vote = model.KeyProperty()
@@ -235,33 +235,34 @@ class Participant(model.Model):
 
   @classmethod
   def get_or_create_participant(cls, game_key, plus_id):
-    # require game key
-    # if isinstance(game_key, Game):
-      # game_key = game_key.key
+    """ Either return the participant associated with the given plus_is,
+    or create a new participant with that id, and deal them some cards.
+    """
+
     def _tx():
       game = game_key.get()
       participant = cls.get_by_id(plus_id, parent=game_key)
       if not participant:
         participant = cls(id=plus_id, parent=game_key)
-        participant.channel_id = str(participant.key) 
+        participant.channel_id = str(participant.key)
         participant.channel_token = channel.create_channel(
             participant.channel_id)
       participant.playing = True
       # deal the hand for the participant.
-      # TODO - check if enough cards etc. ?
-      game.deal_hand(participant)
+      # TODO - deal with the case where the player did not get any cards.
+      hand = game.deal_hand(participant)
+      # if not hand:
+        # react usefully if there were not enough cards for their hand.
       model.put_multi([participant, game])
       return participant
     return model.transaction(_tx)
 
-
-  # card_num is the card number, not the card's index in the list.
   def select_card(self, card_num):
     """ select a card from the participant's hand.
     """
-    if self.selected_card: # if card already selected
+    if self.selected_card:  # if card already selected
       logging.warn(
-          "Participant %s has already selected card %s", 
+          "Participant %s has already selected card %s",
           self.plus_id, self.selected_card)
       return False
     if card_num in self.cards:
@@ -272,7 +273,7 @@ class Participant(model.Model):
       logging.warn(
           "selected card %s was not in participant's cards %s, %s",
           card_num, self.cards, self.plus_id)
-      return False
+      return None
 
 
 

@@ -10,16 +10,24 @@ include dealing out a hand to the player joining.
 The notes below comment on some of the things that still need to be done. (not an exhaustive list.)
 
 I'm experimenting with factoring state transition knowledge from the handler classes (see states.py); this is something
-that would particularly benefit from a design discussion.
+that would benefit from a design discussion.
 
 ------------------------
 Some example request URLs:
 
-In the following URLs, the callback 'url' must be specified, but is not used/needed for non-xhr testing.
+In the following URLs, the callback 'url' must be specified, but is not used/needed for non-xhr testing. So, the arbitrary string 'xyz' is just used here.
 
 INITIAL GAME SETUP
 
-Initial setup-- have some participants join a hangout.  The call will create the hangout and game 
+To fetch the card information, make the following requests:
+
+ http://latte.syd:8080/api/cards?deck=questions&callback=xyz
+ http://latte.syd:8080/api/cards?deck=answers&callback=xyz
+
+These just return json arrays of the decks. Card numbers are sent as integers, and the corresponding card string can be found by using that number as the index into the array.
+
+
+Then, have some participants join a hangout.  The call will create the hangout and game 
 as necessary.  As a participant joins, a 'hand' is dealt for them. 
 
 http://localhost:8080/api/join_game?hangout_id=123&plus_id=p111&callback=xyz
@@ -29,7 +37,8 @@ http://localhost:8080/api/join_game?hangout_id=123&plus_id=p113&callback=xyz
 ANSWER CARD SELECTION
 
 Starting from the above, to make card selection requests, first change the state of the created game in the admin 
-console from 'new' to 'start_round'.
+console from 'new' to 'start_round'. (Cards can be selected in the 'start_round' state).
+
 Then, for each participant, run a 'select_card' request as follows, where 'card_num' is set to one of the
 cards in the participant's 'cards' list.
 You will need to inspect the participant instance to see what cards they have.
@@ -39,19 +48,18 @@ http://localhost:8080/api/select_card?hangout_id=123&plus_id=p112&card_num=17&ca
 
 When a participant selects a card, it will be removed from their 'cards' list, and set as their 'selected_card'.
 
-When all participants have selected a card, the game state should change to from 'start_round' to 'voting'. This 
+When all participants have selected a card, the game state will change to from 'start_round' to 'voting'. This 
 will happen as part of the processing of the last such selection request.
 
 VOTING
 
 From the 'voting' state, a participant can vote (for another participant) like so.  'plus_id' is the id of the 
-user voting, and pvote is the plus_id of the participant they are voting for.  Participants can't vote for themselves.
+user voting, and 'card_num' is the card number selected by the participant they are voting for.  Participants can't vote for their own selections.
+E.g., if some other participant had selected card 24, p112's vote for that card would be:
+http://localhost:8080/api/vote?hangout_id=123&plus_id=p112&card_num=24&callback=xyz
 
-http://localhost:8080/api/vote?hangout_id=123&plus_id=p111&pvote=p112&callback=xyz
-http://localhost:8080/api/vote?hangout_id=123&plus_id=p113&pvote=p112&callback=xyz
-http://localhost:8080/api/vote?hangout_id=123&plus_id=p112&pvote=p113&callback=xyz
 
-After all particpants have voted, the game state should change from 'voting' to 'scores'.  The 'scores' processing 
+After all particpants have voted, the game state will change from 'voting' to 'scores'.  The 'scores' processing 
 will take place as part of the processing of the last such vote request, which will not return until scores processing
 is done. [Note: if we want to, we can push the scores processing off to a task.]
 'scores' is an internal state not accessed directly by any request handler. Another way to phrase this is that while the 
