@@ -42,7 +42,7 @@ class BaseHandler(webapp2.RequestHandler):
         self.resp = rdict
       else:
         self.resp.update(rdict)
-    except:
+    except (AttributeError, TypeError):
       logging.info("bad dict data: %s", rdict)
 
   def render_jresp(self):
