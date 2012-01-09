@@ -6,10 +6,10 @@ from google.appengine.api import channel
 from ndb import model
 
 import cards
+import config
 
 GAME_STATES = ['new', 'start_round', 'voting', 'scores']
-ROUNDS_PER_GAME = 5  # the count starts at 0
-SIZE_OF_HAND = 5  # the number of cards dealt to each participant per game
+
 
 
 class Hangout(model.Model):
@@ -145,7 +145,7 @@ class Game(model.Model):
     """ Deal a (randomly selected) hand from the game's answer deck.
     """
     deck_size = len(self.answer_deck)
-    if deck_size < SIZE_OF_HAND:
+    if deck_size < config.SIZE_OF_HAND:
       logging.warn("not enough cards")
       return None
     # this case, where the participant already has a hand dealt, 'should' not
@@ -153,7 +153,7 @@ class Game(model.Model):
     if participant.cards:
       return participant.cards
     participant.cards = []
-    for _ in range(0, SIZE_OF_HAND):
+    for _ in range(0, config.SIZE_OF_HAND):
       # note: since the deck is already shuffled, probably don't really need to
       # select randomly from it...
       idx = random.randint(0, deck_size-1)
@@ -189,7 +189,7 @@ class Game(model.Model):
     # first check that we have not maxed out the number of rounds for this
     # game.
     # The calling method 'should' have checked this already.
-    if self.current_round >= ROUNDS_PER_GAME:
+    if self.current_round >= (config.ROUNDS_PER_GAME - 1):
       # TODO - assuming it makes sense to have this be an exception, should
       # define a 'GameException' subclass or similar.
       raise Exception("Have reached last round in game; can't start new one.")

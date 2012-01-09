@@ -95,12 +95,15 @@ class LeaveGameHandler(BaseHandler):
 class SendMessageHandler(BaseHandler):
   """ Send a message via the channel API to all participants.
   """
+  # not currently in use.
 
   def get(self):
     hangout_id = self.request.get('hangout_id')
     message = self.request.get('message')
     if not (hangout_id and message):
-      self.render_jsonp({'status': 'OK'})
+      self.render_jsonp(
+          {'status': 'ERROR', 
+           'message': 'message or hangout id not specified.'})
       return
     game = models.Game.get_or_insert(hangout_id)
     participants = models.Participant.query(
@@ -134,8 +137,8 @@ class CardMappingHandler(BaseHandler):
 
 
 # ------------------------------------------
-# The following two handlers make use of the GameState classes, with most
-# of the state transition logic pushed to the state classes.
+# The following two handlers make use of the GameState classes (see
+# states.py), with the state transition logic pushed to the state classes.
 
 
 class VoteHandler(BaseHandler):
@@ -148,8 +151,8 @@ class VoteHandler(BaseHandler):
   # TODO - deal with timeouts, e.g. re: some active players not voting within a
   # reasonable period of time.
 
-  ACTION = 'vote'
-  STATE = 'voting'
+  VOTE_ACTION = 'vote'
+  STATE = 'voting'  # the state that this handler covers
 
   def get(self):
 
@@ -190,9 +193,11 @@ class VoteHandler(BaseHandler):
     # the 'None' arg indicates that it's okay to make any valid transition based
     # on the given action ('vote')
     res1 = gs.try_transition(
-        None, action=self.ACTION, plus_id=plus_id,
+        None, action=self.VOTE_ACTION, plus_id=plus_id,
         card_id=card_id, handler=self)
-    logging.info("result of try_transition on action %s: %s", self.ACTION, res1)
+    logging.info(
+        "result of try_transition on action %s: %s", 
+        self.VOTE_ACTION, res1)
     # now, see if we can do internal transition to 'scores'. (no action)
     res2 = gs.try_transition('scores', plus_id=plus_id,
                              card_id=card_id, handler=self)
@@ -211,8 +216,8 @@ class SelectCardHandler(BaseHandler):
   'start_round' state. A player can't select more than one card.
   """
 
-  ACTION = 'select_card'
-  STATE = 'start_round'
+  SELECT_ACTION = 'select_card'
+  STATE = 'start_round'  # the state that this handler covers
 
   def _broadcast_selected_cards(self, game):
     participants = game.participants()
@@ -262,11 +267,11 @@ class SelectCardHandler(BaseHandler):
     # the 'None' arg indicates that it's okay to make any valid transition based
     # on the given action ('select_card')
     selected_p = gs.try_transition(
-        None, action=self.ACTION, plus_id=plus_id, card_num=card_number,
+        None, action=self.SELECT_ACTION, plus_id=plus_id, card_num=card_number,
         handler=self)
     logging.info(
         "result of try_transition with action %s: %s",
-        self.ACTION, selected_p)
+        self.SELECT_ACTION, selected_p)
     # now, see if we can do internal transition to 'voting'. (no action)
     voting_p = gs.try_transition(
         'voting', plus_id=plus_id, card_num=card_number, handler=self)

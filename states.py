@@ -3,6 +3,7 @@ import logging
 
 from google.appengine.api import channel, memcache
 
+import config
 import models
 
 try:
@@ -277,7 +278,7 @@ class VotingGameState(GameState):
 
     # We can now start a new round.  This resets the card selection and vote
     # fields.  If we've had N rounds, this is a new game instead.  
-    if game.current_round >= models.ROUNDS_PER_GAME:
+    if game.current_round >= (config.ROUNDS_PER_GAME - 1):
       # if have reached the limit of rounds for a game,
       # then start new game using the participants of the current game
       self.start_new_game(participants)
@@ -447,10 +448,11 @@ class StartRoundGameState(GameState):
                {'participant': plus_id,
                 'game_id': game.key.id(),
                 'round': game.current_round}})
+    logging.info("player selection channel msg: %s", message)
     participants = game.participants()
     for p in participants:
-      logging.info("sending channel msg to %s", participant.plus_id)
-      channel.send_message(participant.channel_id, message)
+      logging.info("sending channel msg to %s", p.plus_id)
+      channel.send_message(p.channel_id, message)
     
     return True
 

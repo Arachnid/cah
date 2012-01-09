@@ -34,6 +34,9 @@ http://localhost:8080/api/join_game?hangout_id=123&plus_id=p111&callback=xyz
 http://localhost:8080/api/join_game?hangout_id=123&plus_id=p112&callback=xyz
 http://localhost:8080/api/join_game?hangout_id=123&plus_id=p113&callback=xyz
 
+When a player joins, a json response like the following is returned to them [where here and in the examples below, 'xyz' is the example callback name]:
+xyz({"cards": [31, 4, 32, 40, 35], "game_id": 1, "channel_token": "channel-1666389050-1326098801-Key('Hangout', '123', 'Game', 1, 'Participant', 'p111')"});
+
 ANSWER CARD SELECTION
 
 Starting from the above, to make card selection requests, first change the state of the created game in the admin 
@@ -47,6 +50,15 @@ E.g. if participant p112 has card 17 in their list:
 http://localhost:8080/api/select_card?hangout_id=123&plus_id=p112&card_num=17&callback=xyz
 
 When a participant selects a card, it will be removed from their 'cards' list, and set as their 'selected_card'.
+The response to the selection request looks like this if the request was okay, with the message indicating the card number:
+ xyz({"status": "OK", "message": 17});
+
+If the player has already selected a card, the already-selected card will be returned, with status 'OK' (the same message as above).
+If a player requests a selection that's not in their hand, the response will have error status and look like:
+ xyz({"status": "ERROR", "message": "could not select card 11 from hand"});
+
+After each player selects a card, a message like the following is broadcast on the players' channels (indicating who played, but not what they picked):
+  {"player_selection": {"game_id": 1, "participant": "p111", "round": 4}}
 
 When all participants have selected a card, the game state will change to from 'start_round' to 'voting'. This 
 will happen as part of the processing of the last such selection request.
@@ -58,6 +70,13 @@ user voting, and 'card_num' is the card number selected by the participant they 
 E.g., if some other participant had selected card 24, p112's vote for that card would be:
 http://localhost:8080/api/vote?hangout_id=123&plus_id=p112&card_num=24&callback=xyz
 
+If all is okay, the response is:
+ xyz({"status": "OK"});
+If the requested card number does not match any selected card, or the plus_id does not belong to a participant, the response is:
+ xyz({"status": "ERROR", "message": "Voting information not properly specified"});
+If the card number is the card that the same participant selected, the response is:
+ xyz({"status": "ERROR", "message": "Participants cannot vote for themselves."});
+
 
 After all particpants have voted, the game state will change from 'voting' to 'scores'.  The 'scores' processing 
 will take place as part of the processing of the last such vote request, which will not return until scores processing
@@ -67,6 +86,10 @@ game is in the internal 'scores' state, request handlers that test for other sta
 
 In the 'scores' state, scores for the round are calculated and sent via the channel api to the 
 participants. The current score calculation is probably too simplistic.
+
+The scores info broadcast to each player will look similar to this:
+{"scores_info": {"game_id": 1, "participant_scores": {"p112": {"score": 1, "game_score": 2, "hangout_score": 2}, "p111": {"score": 1, "game_score": 2, "hangout_score": 2}}, "round": 1}}
+
 Then, one of two things happen:
  - if there are still rounds to go in the game, the round count is updated, the game is set to 'start_round', and
  a new round is set up (the participants' votes and selected cards are cleared, and a new question card for the round
