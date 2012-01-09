@@ -2,6 +2,7 @@
 
 import datetime
 import difflib
+import os
 import pickle
 import re
 import unittest
@@ -514,6 +515,12 @@ class ModelTests(test_utils.NDBTest):
     key2 = ad.pb_to_key(pbk1)
     self.assertEqual(key1, key2)
 
+  def testPropertyVerboseNameAttribute(self):
+    class Foo(model.Model):
+      name = model.StringProperty(verbose_name='Full name')
+    np = Foo._properties['name']
+    self.assertEqual('Full name', np._verbose_name)
+
   def testQuery(self):
     class MyModel(model.Model):
       p = model.IntegerProperty()
@@ -600,6 +607,31 @@ class ModelTests(test_utils.NDBTest):
     for q in qq:
       r = q.fetch()
       self.assertEqual(r, [m2], str(q))
+
+  def testBottom(self):
+    a = model._BaseValue(42)
+    b = model._BaseValue(42)
+    c = model._BaseValue('hello')
+    self.assertEqual("_BaseValue(42)", repr(a))
+    self.assertEqual("_BaseValue('hello')", repr(c))
+    self.assertTrue(a == b)
+    self.assertFalse(a != b)
+    self.assertTrue(b != c)
+    self.assertFalse(b == c)
+    self.assertFalse(a == 42)
+    self.assertTrue(a != 42)
+
+  def testCompressedValue(self):
+    a = model._CompressedValue('xyz')
+    b = model._CompressedValue('xyz')
+    c = model._CompressedValue('abc')
+    self.assertEqual("_CompressedValue('abc')", repr(c))
+    self.assertTrue(a == b)
+    self.assertFalse(a != b)
+    self.assertTrue(b != c)
+    self.assertFalse(b == c)
+    self.assertFalse(a == 'xyz')
+    self.assertTrue(a != 'xyz')
 
   def testProperty(self):
     class MyModel(model.Model):
@@ -836,6 +868,81 @@ class ModelTests(test_utils.NDBTest):
     self.assertEqual(ent.key, k)
     self.assertEqual(MyModel.t._get_value(ent), u'Hello world\u1234')
     self.assertEqual(MyModel.b._get_value(ent), '\x00\xff')
+
+  def testUserPropertyAutoFlags(self):
+    # Can't combind auto_current_user* with repeated.
+    self.assertRaises(ValueError, model.UserProperty,
+                      repeated=True, auto_current_user_add=True)
+    self.assertRaises(ValueError, model.UserProperty,
+                      repeated=True, auto_current_user=True)
+
+    # Define a model with user properties.
+    class MyModel(model.Model):
+      u0 = model.UserProperty(auto_current_user_add=True)
+      u1 = model.UserProperty(auto_current_user=True)
+
+    # Without a current user, these remain None.
+    x = MyModel()
+    k = x.put()
+    y = k.get()
+    self.assertTrue(y.u0 is None)
+    self.assertTrue(y.u1 is None)
+
+    try:
+      # When there is a current user, it sets both.
+      os.environ['USER_EMAIL'] = 'test@example.com'
+      x = MyModel()
+      k = x.put()
+      y = k.get()
+      self.assertFalse(y.u0 is None)
+      self.assertFalse(y.u1 is None)
+      self.assertEqual(y.u0, users.User(email='test@example.com'))
+      self.assertEqual(y.u1, users.User(email='test@example.com'))
+
+      # When the current user changes, only u1 is changed.
+      os.environ['USER_EMAIL'] = 'test2@example.com'
+      x.put()
+      y = k.get()
+      self.assertEqual(y.u0, users.User(email='test@example.com'))
+      self.assertEqual(y.u1, users.User(email='test2@example.com'))
+
+      # When we delete the property values, both are reset.
+      del x.u0
+      del x.u1
+      x.put()
+      y = k.get()
+      self.assertEqual(y.u0, users.User(email='test2@example.com'))
+      self.assertEqual(y.u1, users.User(email='test2@example.com'))
+
+      # When we set them to None, u0 stays None, u1 is reset.
+      x.u0 = None
+      x.u1 = None
+      x.put()
+      y = k.get()
+      self.assertEqual(y.u0, None)
+      self.assertEqual(y.u1, users.User(email='test2@example.com'))
+
+    finally:
+      # Reset environment.
+      del os.environ['USER_EMAIL']
+
+  def testPickleProperty(self):
+    class MyModel(model.Model):
+      pkl = model.PickleProperty()
+    sample = {'one': 1, 2: [1, 2, '3'], 3.: model.Model}
+    ent = MyModel(pkl=sample)
+    ent.put()
+    ent2 = ent.key.get()
+    self.assertTrue(ent2.pkl == sample)
+
+  def testJsonProperty(self):
+    class MyModel(model.Model):
+      pkl = model.JsonProperty()
+    sample = [1, 2, {'a': 'one', 'b': [1, 2]}, 'xyzzy', [1, 2, 3]]
+    ent = MyModel(pkl=sample)
+    ent.put()
+    ent2 = ent.key.get()
+    self.assertTrue(ent2.pkl == sample)
 
   def DateAndOrTimePropertyTest(self, propclass, t1, t2):
     class ClockInOut(model.Model):
@@ -1134,10 +1241,14 @@ class ModelTests(test_utils.NDBTest):
     model.Model._reset_kind_map()
     class A1(model.Model):
       pass
-    self.assertEqual(model.Model._get_kind_map(), {'A1': A1})
+    def get_kind_map():
+      # Return the kind map with __* removed.
+      d = model.Model._kind_map
+      return dict(kv for kv in d.iteritems() if not kv[0].startswith('__'))
+    self.assertEqual(get_kind_map(), {'A1': A1})
     class A2(model.Model):
       pass
-    self.assertEqual(model.Model._get_kind_map(), {'A1': A1, 'A2': A2})
+    self.assertEqual(get_kind_map(), {'A1': A1, 'A2': A2})
 
   def testMultipleProperty(self):
     class Person(model.Model):
@@ -1267,6 +1378,47 @@ class ModelTests(test_utils.NDBTest):
                      "tags=StringProperty('tags', repeated=True)"
                      ">")
 
+  def testModelToDict(self):
+    class MyModel(model.Model):
+      foo = model.StringProperty(name='f')
+      bar = model.StringProperty(default='bar')
+      baz = model.StringProperty(repeated=True)
+    ent = MyModel()
+    self.assertEqual({'foo': None, 'bar': 'bar', 'baz': []},
+                     ent._to_dict())
+    self.assertEqual({'foo': None}, ent._to_dict(include=['foo']))
+    self.assertEqual({'bar': 'bar', 'baz': []},
+                     ent._to_dict(exclude=frozenset(['foo'])))
+    self.assertEqual({}, ent.to_dict(include=['foo'], exclude=['foo']))
+    self.assertRaises(TypeError, ent._to_dict, include='foo')
+    self.assertRaises(TypeError, ent._to_dict, exclude='foo')
+    ent.foo = 'x'
+    ent.bar = 'y'
+    ent.baz = ['a']
+    self.assertEqual({'foo': 'x', 'bar': 'y', 'baz': ['a']},
+                     ent.to_dict())
+
+  def testModelToDictStructures(self):
+    class MySubmodel(model.Model):
+      foo = model.StringProperty()
+      bar = model.IntegerProperty()
+    class MyModel(model.Model):
+      a = model.StructuredProperty(MySubmodel)
+      b = model.LocalStructuredProperty(MySubmodel, repeated=True)
+      c = model.StructuredProperty(MySubmodel)
+      d = model.LocalStructuredProperty(MySubmodel)
+      e = model.StructuredProperty(MySubmodel, repeated=True)
+    x = MyModel(a=MySubmodel(foo='foo', bar=42),
+                b=[MySubmodel(foo='f'), MySubmodel(bar=4)])
+    self.assertEqual({'a': {'foo': 'foo', 'bar': 42},
+                      'b': [{'foo': 'f', 'bar': None,},
+                            {'foo': None, 'bar': 4}],
+                      'c': None,
+                      'd': None,
+                      'e': [],
+                      },
+                     x.to_dict())
+
   def testModelPickling(self):
     global MyModel
     class MyModel(model.Model):
@@ -1319,6 +1471,25 @@ class ModelTests(test_utils.NDBTest):
       repr(p),
       "Person(key=Key('Person', 42), "
       "address=Address(city='SF', street='345 Spear'), name='Google')")
+
+  def testModelReprNoSideEffects(self):
+    class Address(model.Model):
+      street = model.StringProperty()
+      city = model.StringProperty()
+    a = Address(street='345 Spear', city='SF')
+    # White box test: values are 'top values'.
+    self.assertEqual(a._values, {'street': '345 Spear', 'city': 'SF'})
+    a.put()
+    # White box test: put() has turned wrapped values in _BaseValue().
+    self.assertEqual(a._values, {'street': model._BaseValue('345 Spear'),
+                                 'city': model._BaseValue('SF')})
+    self.assertEqual(repr(a),
+                     "Address(key=Key('Address', 1), "
+                     # (Note: Unicode literals.)
+                     "city=u'SF', street=u'345 Spear')")
+    # White box test: _values is unchanged.
+    self.assertEqual(a._values, {'street': model._BaseValue('345 Spear'),
+                                 'city': model._BaseValue('SF')})
 
   def testModelRepr_RenamedProperty(self):
     class Address(model.Model):
@@ -2514,11 +2685,15 @@ class ModelTests(test_utils.NDBTest):
         # dummy
         return value
 
-      def _serialize_value(self, value):
-        return value.__repr__()
+      def _to_base_type(self, value):
+        if not isinstance(value, str):
+          value = value.__repr__()
+        return value
 
-      def _deserialize_value(self, value):
-        return eval(value)
+      def _from_base_type(self, value):
+        if isinstance(value, str):
+          value = eval(value)
+        return value
 
     class M(model.Model):
       p1 = ReprProperty()
@@ -2696,6 +2871,91 @@ class ModelTests(test_utils.NDBTest):
       fut.get_result()
     self.assertEqual(self.post_counter, 11,
                      'Post put hooks not called on put_multi')
+
+  def testGetByIdHooksCalled(self):
+    # See issue 95.  http://goo.gl/QSRQH
+    # Adapted from testGetHooksCalled in key_test.py.
+    test = self # Closure for inside hook
+    self.pre_counter = 0
+    self.post_counter = 0
+
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_get_hook(cls, key):
+        test.pre_counter += 1
+        if test.pre_counter == 1:  # Cannot test for key in get_multi
+          self.assertEqual(key, self.key)
+      @classmethod
+      def _post_get_hook(cls, key, future):
+        test.post_counter += 1
+        self.assertEqual(key, self.key)
+        self.assertEqual(future.get_result(), self.entity)
+
+    furniture = HatStand()
+    self.entity = furniture
+    key = furniture.put()
+    self.key = key
+    self.assertEqual(self.pre_counter, 0, 'Pre get hook called early')
+    future = HatStand.get_by_id_async(key.id())
+    self.assertEqual(self.pre_counter, 1, 'Pre get hook not called')
+    self.assertEqual(self.post_counter, 0, 'Post get hook called early')
+    future.get_result()
+    self.assertEqual(self.post_counter, 1, 'Post get hook not called')
+
+    # All counters now read 1, calling get for 10 keys should make this 11
+    new_furniture = [HatStand() for _ in range(10)]
+    keys = [furniture.put() for furniture in new_furniture]  # Sequential keys
+    multi_future = [HatStand.get_by_id_async(key.id()) for key in keys]
+    self.assertEqual(self.pre_counter, 11,
+                     'Pre get hooks not called on get_multi')
+    self.assertEqual(self.post_counter, 1,
+                     'Post get hooks called early on get_multi')
+    for fut, key, entity in zip(multi_future, keys, new_furniture):
+      self.key = key
+      self.entity = entity
+      fut.get_result()
+    self.assertEqual(self.post_counter, 11,
+                     'Post get hooks not called on get_multi')
+
+  def testGetOrInsertHooksCalled(self):
+    # See issue 98.  http://goo.gl/7ak2i
+    test = self # Closure for inside hooks
+
+    class HatStand(model.Model):
+      @classmethod
+      def _pre_get_hook(cls, key):
+        test.pre_get_counter += 1
+      @classmethod
+      def _post_get_hook(cls, key, future):
+        test.post_get_counter += 1
+      def _pre_put_hook(self):
+        test.pre_put_counter += 1
+      def _post_put_hook(self, future):
+        test.post_put_counter += 1
+
+    # First call creates it.  This calls get() twice (once outside the
+    # transaction and once inside it) and put() once (from inside the
+    # transaction).
+    self.pre_get_counter = 0
+    self.post_get_counter = 0
+    self.pre_put_counter = 0
+    self.post_put_counter = 0
+    HatStand.get_or_insert('classic')
+    self.assertEqual(self.pre_get_counter, 2)
+    self.assertEqual(self.post_get_counter, 2)
+    self.assertEqual(self.pre_put_counter, 1)
+    self.assertEqual(self.post_put_counter, 1)
+
+    # Second call gets it without needing a transaction.
+    self.pre_get_counter = 0
+    self.post_get_counter = 0
+    self.pre_put_counter = 0
+    self.post_put_counter = 0
+    HatStand.get_or_insert_async('classic').get_result()
+    self.assertEqual(self.pre_get_counter, 1)
+    self.assertEqual(self.post_get_counter, 1)
+    self.assertEqual(self.pre_put_counter, 0)
+    self.assertEqual(self.post_put_counter, 0)
 
   def testMonkeyPatchHooks(self):
     test = self # Closure for inside put hooks
@@ -2876,6 +3136,60 @@ class CacheTests(test_utils.NDBTest):
     e = key.get()
     self.assertEqual(e, None)
 
+  def testCustomStructuredPropertyInRepeatedStructuredProperty(self):
+    class FuzzyDate(object):
+
+      def __init__(self, first, last=None):
+        assert isinstance(first, datetime.date)
+        assert last is None or isinstance(last, datetime.date)
+        self.first = first
+        self.last = last or first
+
+      def __eq__(self, other):
+        if not isinstance(other, FuzzyDate):
+          return NotImplemented
+        return self.first == other.first and self.last == other.last
+
+      def __ne__(self, other):
+        eq = self.__eq__(other)
+        if eq is not NotImplemented:
+          eq = not eq
+        return eq
+
+      def __repr__(self):
+        return 'FuzzyDate(%r, %r)' % (self.first, self.last)
+
+    class FuzzyDateModel(model.Model):
+      first = model.DateProperty()
+      last = model.DateProperty()
+
+    class FuzzyDateProperty(model.StructuredProperty):
+
+      def __init__(self, **kwds):
+        super(FuzzyDateProperty, self).__init__(FuzzyDateModel, **kwds)
+
+      def _validate(self, value):
+        assert isinstance(value, FuzzyDate)
+
+      def _to_base_type(self, value):
+        return FuzzyDateModel(first=value.first, last=value.last)
+
+      def _from_base_type(self, value):
+        return FuzzyDate(value.first, value.last)
+
+    class Inner(model.Model):
+      date = FuzzyDateProperty()
+
+    class Outer(model.Model):
+      wrap = model.StructuredProperty(Inner, repeated=True)
+
+    d = datetime.date(1900,1,1)
+    fd = FuzzyDate(d)
+    orig = Outer(wrap=[Inner(date=fd), Inner(date=fd)])
+    key = orig.put()
+    q = Outer.query()
+    copy = q.get()
+    self.assertEqual(copy, orig)
 
 def main():
   unittest.main()

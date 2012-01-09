@@ -32,7 +32,11 @@ class BaseHandler(webapp2.RequestHandler):
                                      simplejson.dumps(response)))
 
   def accumulate_response(self, rdict):
-    """..."""
+    """ builds a message dict (to be returned to the client as json).
+    """
+    # TODO - the idea was that different stages of processing could
+    # contribute different info to the dict; though currently it's not really
+    # necessary to do this.
     try:
       if not hasattr(self, 'resp'):
         self.resp = rdict
@@ -42,7 +46,6 @@ class BaseHandler(webapp2.RequestHandler):
       logging.info("bad dict data: %s", rdict)
 
   def render_jresp(self):
-    """..."""
     if hasattr(self, 'resp') and self.resp:
       self.render_jsonp(self.resp)
 
@@ -56,7 +59,7 @@ class JoinGameHandler(BaseHandler):
     hangout_id = self.request.GET['hangout_id']
     game = models.Hangout.get_current_game(hangout_id)
     plus_id = self.request.GET['plus_id']
-    # now, add the participant and in the process, deal their hand from
+    # add the participant, and in the process, deal their hand from
     # the game cards.
     participant = models.Participant.get_or_create_participant(
         game.key, plus_id)
@@ -90,7 +93,7 @@ class LeaveGameHandler(BaseHandler):
 
 
 class SendMessageHandler(BaseHandler):
-  """ Send a message via the channel to all participants.
+  """ Send a message via the channel API to all participants.
   """
 
   def get(self):
@@ -112,8 +115,7 @@ class CardMappingHandler(BaseHandler):
   """ Send the client the card deck list info, so card numbers can be mapped
   to their text client-side.
   """
-  # it should be sufficient just to pass the json-ified arrays..
-
+  # it should be sufficient just to pass the json-ified arrays.
   def get(self):
     deck = self.request.get('deck')
     if not deck:
@@ -133,7 +135,7 @@ class CardMappingHandler(BaseHandler):
 
 # ------------------------------------------
 # The following two handlers make use of the GameState classes, with most
-# of the state transition logic pushed there.
+# of the state transition logic pushed to the state classes.
 
 
 class VoteHandler(BaseHandler):
@@ -143,10 +145,11 @@ class VoteHandler(BaseHandler):
   the game is in the 'voting' state.
   """
 
-  # TODO - deal with timeouts, re: some active players not voting within a
+  # TODO - deal with timeouts, e.g. re: some active players not voting within a
   # reasonable period of time.
 
   ACTION = 'vote'
+  STATE = 'voting'
 
   def get(self):
 
@@ -163,7 +166,7 @@ class VoteHandler(BaseHandler):
           {'status': 'ERROR',
            'message' : "Game for hangout %s not found" % (hangout_id,)})
       return
-    if not game.state == 'voting':
+    if not game.state == self.STATE:
       self.render_jsonp(
           {'status' : 'ERROR',
            'message': (
@@ -181,8 +184,9 @@ class VoteHandler(BaseHandler):
       self.render_jsonp(
           {'status': 'ERROR', 'message': "Voting data incomplete"})
       return
-    gs = states.GameStateFactory.get_game_state('voting', hangout_id)
-    logging.info("about to attempt state transition")
+    # create a 'voting' game state.
+    gs = states.GameStateFactory.get_game_state(self.STATE, hangout_id)
+    # logging.info("about to attempt state transition")
     # the 'None' arg indicates that it's okay to make any valid transition based
     # on the given action ('vote')
     res1 = gs.try_transition(
@@ -208,6 +212,7 @@ class SelectCardHandler(BaseHandler):
   """
 
   ACTION = 'select_card'
+  STATE = 'start_round'
 
   def _broadcast_selected_cards(self, game):
     participants = game.participants()
@@ -231,7 +236,7 @@ class SelectCardHandler(BaseHandler):
           {'status': 'ERROR',
            'message': "Game for hangout %s not found" % (hangout_id,)})
       return
-    if not game.state == 'start_round':
+    if not game.state == self.STATE:
       self.render_jsonp(
           {'status': 'ERROR',
            'message': (
@@ -252,8 +257,8 @@ class SelectCardHandler(BaseHandler):
           {'status': 'ERROR',
            'message': "Card number is not an integer"})
       return
-    gs = states.GameStateFactory.get_game_state('start_round', hangout_id)
-    logging.info("about to attempt state transition")
+    gs = states.GameStateFactory.get_game_state(self.STATE, hangout_id)
+    # logging.info("about to attempt state transition")
     # the 'None' arg indicates that it's okay to make any valid transition based
     # on the given action ('select_card')
     selected_p = gs.try_transition(

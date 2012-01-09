@@ -48,13 +48,9 @@ class Hangout(model.Model):
   @classmethod
   def start_new_game(cls, hangout_id, old_participants):
     """If there is a current game, set its end time.  Then create a new game
-    as the current hangout game, using the given participant list (of the
-    current game). Returns the new game.
+    and set it as the current hangout game, using the participant list of the
+    previous game. Returns the new game.
     """
-    # set the end date of the current
-    # game and get its list of participant's plus ids.  Create the new game and
-    # its new participant objects from the list of plus ids.
-
     hangout = cls.get_by_id(hangout_id)
     if not hangout:  # TODO: should this be an error instead?
       hangout = cls(id=hangout_id)
@@ -73,9 +69,10 @@ class Hangout(model.Model):
     new_participants = []
     for p in old_participants:
       newp = Participant(id=p.plus_id, parent=new_game.key)
-      # hmm, should keep the same channel id and token,
-      # unless push out the new one somehow. This might be problematic
-      # (channel id is based on participant key from original game).
+      # keep the same channel id and token.
+      # TODO - are there any issues in doing this?
+      # (channel id is based on participant key from original game, but thus
+      # far we don't ever need to reconstruct the keys).
       newp.channel_id = p.channel_id
       newp.channel_token = p.channel_token
       newp.hangout_score = p.hangout_score
@@ -92,14 +89,14 @@ class Hangout(model.Model):
 
 class Game(model.Model):
   """ Encode information about a hangout game.  Participants are child entities
-  of their game.
-  Games are child entities of their hangout.
+  of a game.
   """
 
   state = model.StringProperty(choices=GAME_STATES, default='new')
   question_deck = model.IntegerProperty(repeated=True)
   answer_deck = model.IntegerProperty(repeated=True)
   current_question = model.IntegerProperty()
+  # pause/timeout logic not yet implemented.
   is_paused = model.BooleanProperty(default=False)
   timeout_at = model.DateTimeProperty()
   start_time = model.DateTimeProperty(auto_now_add=True)
@@ -144,8 +141,6 @@ class Game(model.Model):
     for p in participants:
       self.deal_hand(p)
 
-  # TODO: the participant 'should' not be already holding any cards. Should
-  # probably check for that.
   def deal_hand(self, participant):
     """ Deal a (randomly selected) hand from the game's answer deck.
     """
@@ -153,6 +148,10 @@ class Game(model.Model):
     if deck_size < SIZE_OF_HAND:
       logging.warn("not enough cards")
       return None
+    # this case, where the participant already has a hand dealt, 'should' not
+    # actually come up.  (should it be an error if it does?)
+    if participant.cards:
+      return participant.cards
     participant.cards = []
     for _ in range(0, SIZE_OF_HAND):
       # note: since the deck is already shuffled, probably don't really need to
@@ -168,14 +167,13 @@ class Game(model.Model):
     logging.debug("answer deck is now: %s", self.answer_deck)
     return participant.cards
 
-  # TODO: actually, since the deck is already shuffled, don't really need to
-  # select randomly from it, though it shouldn't hurt anything.
   def select_new_question(self):
     """ select a question card (randomly) from the game's question deck.
     """
     logging.debug(
         "in select_new_question with starting qdeck: %s", self.question_deck)
-    # select at random from the question deck
+    # select at random from the question deck (the random selection may be
+    # overkill since deck is shuffled)
     qnum = random.randint(0, len(self.question_deck)-1)
     self.current_question = self.question_deck[qnum]
     # remove selected from the deck
@@ -185,7 +183,6 @@ class Game(model.Model):
         self.current_question, self.question_deck)
     self.put()
 
-  # note: not in its own txn, but is called in the context of a txn.
   def start_new_round(self, participants):
     """ start a new round of the given game.
     """
@@ -201,8 +198,8 @@ class Game(model.Model):
     self.select_new_question()
     self.current_round += 1
     # now reset the participants' votes, card selections, and round score.
-    # Don't reset the overall game score.
-    # participants = self.participants()
+    # Keep the game and hangout scores.
+    logging.info("in start_new_round, with participants %s", participants)
     for p in participants:
       p.vote = None
       p.selected_card = None
@@ -212,16 +209,15 @@ class Game(model.Model):
 
 
 class Participant(model.Model):
-  """..."""
-  # Child entity of the Game in which it is participating
-
+  """ Child entity of the Game in which it is participating."""
+  
   channel_id = model.StringProperty(indexed=False)
   channel_token = model.StringProperty(indexed=False)
   playing = model.BooleanProperty(default=True)
   score = model.IntegerProperty(default=0) #score for round
   game_score = model.IntegerProperty(default=0) #score for game; not preserved
       # across games.
-  # TODO - this total score is simply accumulated for the whole hangout,
+  # TODO - hangout_score is simply accumulated for the whole hangout,
   # not taking into account leave/join events.  Might want different logic.
   hangout_score = model.IntegerProperty(default=0)
   cards = model.IntegerProperty(repeated=True)
@@ -249,7 +245,8 @@ class Participant(model.Model):
             participant.channel_id)
       participant.playing = True
       # deal the hand for the participant.
-      # TODO - deal with the case where the player did not get any cards.
+      # TODO - deal with the case where the player did not get any cards,
+      # indicated if hand is None.
       hand = game.deal_hand(participant)
       # if not hand:
         # react usefully if there were not enough cards for their hand.

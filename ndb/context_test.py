@@ -191,7 +191,48 @@ class ContextTests(test_utils.NDBTest):
       self.assertTrue(self.ctx._cache[key] is None)  # Whitebox.
       a = yield self.ctx.get(key1)
       self.assertTrue(a is None)
+      self.ctx.clear_cache()
+      self.assertEqual(self.ctx._cache, {})  # Whitebox.
     foo().check_success()
+
+  def testContext_CacheMemcache(self):
+    # Test that when get() finds the value in memcache, it updates
+    # _cache.
+    class Foo(model.Model):
+      pass
+    ctx = self.ctx
+    ctx.set_cache_policy(False)
+    ctx.set_memcache_policy(False)
+    ent = Foo()
+    key = ent.put()
+    mkey = ctx._memcache_prefix + key.urlsafe()
+    self.assertFalse(key in ctx._cache)
+    self.assertEqual(None, memcache.get(mkey))
+    ctx.set_memcache_policy(True)
+    key.get()
+    self.assertFalse(key in ctx._cache)
+    self.assertNotEqual(None, memcache.get(mkey))
+    eventloop.run()
+    ctx.set_cache_policy(True)
+    key.get()  # Satisfied from memcache
+    self.assertTrue(key in ctx._cache)
+
+  def testContext_CacheMisses(self):
+    # Test that get() caches misses if use_datastore is true but not
+    # if false.  This involves whitebox checks using ctx._cache.
+    # See issue 106.  http://goo.gl/DLiij
+    ctx = self.ctx
+    key = model.Key('Foo', 42)
+    self.assertFalse(key in ctx._cache)
+    ctx.get(key, use_datastore=False).wait()
+    self.assertFalse(key in ctx._cache)
+    ctx.get(key, use_memcache=False).wait()
+    self.assertTrue(key in ctx._cache)
+    self.assertEqual(ctx._cache[key], None)
+    ctx.clear_cache()
+    ctx.get(key).wait()
+    self.assertTrue(key in ctx._cache)
+    self.assertEqual(ctx._cache[key], None)
 
   def testContext_CachePolicy(self):
     def should_cache(unused_key):
@@ -345,17 +386,17 @@ class ContextTests(test_utils.NDBTest):
 
     memcache.flush_all()
 
-    # Test _clear_memcache (it doesn't delete, it locks, like put)
+    # Test _clear_memcache (it deletes the keys)
     self.ctx._clear_memcache([k1, k2]).check_success()
     # Nothing should be in the empty namespace
     assertNone(memcache.get(mk1, namespace=''))
     assertNone(memcache.get(mk2, namespace=''))
-    # Only k1 is found in namespace 'a', as _LOCKED
-    assertLocked(memcache.get(mk1, namespace='a'))
+    # Nothing should be in namespace 'a'
+    assertNone(memcache.get(mk1, namespace='a'))
     assertNone(memcache.get(mk2, namespace='a'))
-    # Only k2 is found in namespace 'b', as _LOCKED
+    # Nothing should be in namespace 'b'
     assertNone(memcache.get(mk1, namespace='b'))
-    assertLocked(memcache.get(mk2, namespace='b'))
+    assertNone(memcache.get(mk2, namespace='b'))
 
   def testContext_Memcache(self):
     @tasklets.tasklet
@@ -481,8 +522,8 @@ class ContextTests(test_utils.NDBTest):
       qry = query.Query(kind='Foo')
       results = yield self.ctx.map_query(qry, callback)
       self.assertEqual(results, [ent1, ent2])
-      self.assertTrue(results[0] is ent1)
-      self.assertTrue(results[1] is ent2)
+      self.assertTrue(results[0] is self.ctx._cache[ent1.key])
+      self.assertTrue(results[1] is self.ctx._cache[ent2.key])
     foo().check_success()
 
   def testContext_AllocateIds(self):
@@ -684,6 +725,52 @@ class ContextTests(test_utils.NDBTest):
       # In 1.5.4, XG transactions are not supported
       res = self.ctx.transaction(tx, xg=True).get_result()
       self.assertEqual(res, 42)
+
+  def testContext_TransactionMemcache(self):
+    class Foo(model.Model):
+      name = model.StringProperty()
+
+    foo1 = Foo(name='foo1')
+    foo2 = Foo(name='foo2')
+    key1 = foo1.put()
+    key2 = foo2.put()
+    skey1 = self.ctx._memcache_prefix + key1.urlsafe()
+    skey2 = self.ctx._memcache_prefix + key2.urlsafe()
+
+    # Be sure nothing is in memcache.
+    self.assertEqual(memcache.get(skey1), None)
+    self.assertEqual(memcache.get(skey2), None)
+
+    # Be sure nothing is in the context cache.
+    self.ctx.clear_cache()
+
+    # Run some code in a transaction.
+    def txn():
+      ctx = tasklets.get_context()
+      self.assertTrue(ctx is not self.ctx)
+      f1 = key1.get()
+      f2 = key1.get()
+      f1.name += 'a'
+      f1.put()
+      # Don't put f2.
+      # Verify the state of memcache.
+      self.assertEqual(memcache.get(skey1), context._LOCKED)
+      self.assertEqual(memcache.get(skey2), None)
+    self.ctx.transaction(txn).wait()
+
+    # Verify memcache is cleared.
+    self.assertEqual(memcache.get(skey1), None)
+    self.assertEqual(memcache.get(skey2), None)
+
+    # Clear the context cache.
+    self.ctx.clear_cache()
+
+    # Non-transactional get() updates memcache.
+    f1 = key1.get()
+    f2 = key2.get()
+    eventloop.run()  # Wait for memcache.set() RPCs
+    self.assertNotEqual(memcache.get(skey1), None)
+    self.assertNotEqual(memcache.get(skey2), None)
 
   def testContext_GetOrInsert(self):
     # This also tests Context.transaction()

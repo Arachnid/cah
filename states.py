@@ -152,7 +152,9 @@ class VotingGameState(GameState):
         models.Participant.playing == True,
         models.Participant.vote == None,
         ancestor=game_key).fetch()
-    logging.info("partipants who have not voted: %s", participants)
+    logging.info(
+            "participants who have not voted: %s", 
+            [p.plus_id for p in participants])
     if participants:
       return False
     else:
@@ -418,9 +420,6 @@ class StartRoundGameState(GameState):
                'message': (
                    "Can't vote now, wrong game state %s." % (game.state,))})
         return False
-    # Hmm, this query needs to be done prior to the participant mods, else there
-    # is a txn Conflict error.
-    participants = game.participants()
     participant_key = model.Key(models.Participant, plus_id, parent=game.key)
     participant = participant_key.get()
     if not participant:
@@ -448,6 +447,7 @@ class StartRoundGameState(GameState):
                {'participant': plus_id,
                 'game_id': game.key.id(),
                 'round': game.current_round}})
+    participants = game.participants()
     for p in participants:
       logging.info("sending channel msg to %s", participant.plus_id)
       channel.send_message(participant.channel_id, message)
